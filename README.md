@@ -27,6 +27,19 @@ WorkBuddy 的**上下文治理 Mod**（Mod-first）：进程内 `tool.call` 中�
 3. **软超时自弃**——压缩自带 100ms 预算（可调），超时放弃、透传原文。
 4. **fail-open**——未知结果形状、任何异常、`isError`、非零退出码：一律原样返回。插件坏掉的最坏情况 = 当它不存在。
 5. **无共享可变状态文件**——spill 路径 `spill/<session前8位>/<序号>-<callId>.txt`，并发不互踩（50 路并发有单测）。
+6. **触发频率天然低**——事故源在每个回合同步跑；我们只在「Bash 且超预算且退出码 0」时才做 IO，低于预算的调用一个 `indexOf` 就返回。
+
+### 热路径延迟实测（本机）
+
+| 输入 | 首次 | 20 次最大 | 说明 |
+|---|---|---|---|
+| 150KB（3k 行） | 2.6ms | 2.5ms | 典型大输出 |
+| 1MB（20k 行） | 7.9ms | 18.5ms | |
+| 10MB（200k 行） | 91.3ms | 101.1ms | 已到 100ms 软超时，自弃机制生效 |
+
+唯一的同步 IO 是落盘 `$.fs.write`，已封顶：**原文 >4MB 不落盘**（仍压缩，标记如实写「未落盘（原文过大或写入失败，可重跑命令）」）。引擎侧还有最后一道兜底：Mod 每钩 10s 预算且失败隔离上报——即便我们全部失算，结局也只是「这一条不压」，不会像 shell hook 那样把用户按回车整条阻塞掉。
+
+**后续拓展所有事件时的纪律**（写在这里就是为了下次不破坏它）：任何新 handler 必须保持——零子进程、只读 O(1) 宿主状态、扫描必须带 deadline、写必须带 size cap、保持 fail-open。
 
 ## 行为
 
@@ -62,7 +75,7 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" --
 ## 开发 / 测试
 
 ```bash
-node --test test/register.test.ts   # 12 项，全绿
+node --test test/register.test.ts   # 13 项，全绿
 ```
 
 沙箱纪律：mods 内禁止 `node:require/process/global`（引擎会当场拒绝整个 mod），`register.ts` 唯一的 import 是 `codebuddy-code` 的**纯类型**导入，运行时被擦除。所有宿主能力走 `$`：`$.env` / `$.fs.write` / `$.session.id()`。

@@ -23,6 +23,9 @@ const FOREIGN_MARKERS = ['[wb-ops 省略', '[wb-ops 以下为原文末尾'];
 
 const DEFAULT_BUDGET = 8000;                 // 最终文本长度上限（字符≈ASCII字节）
 const DEFAULT_DEADLINE_MS = 100;             // 压缩自设软超时；超时放弃，返回原文
+const MAX_SPILL_CHARS = 4_000_000;           // 落盘写入门槛：超过不写（热路径唯一的同步 IO 必须封顶）
+// ponytail: 上限=4MB 以上的原文不落盘（仍压缩，标记如实说明「过大」）；升级路径=分块异步写或
+// 只存最长空洞段（sana trim.py 的取舍）。split 本身对 100MB 输出约 0.5–1s，线性且有引擎 10s 兜底。
 const HEAD_MAX_LINES = 12;
 const STRONG_MAX_LINES = 40;
 const LINE_MAX_CHARS = 300;
@@ -118,7 +121,7 @@ export function compress(raw: string, budget: number, deadlineMs: number, spillP
   dropped = lines.length - headKeep - tailFinal.length - strong.length;
   if (dropped < 0) dropped = 0;
 
-  const note = `${MARKER} 已省略 ${dropped} 行 · 原文 ${raw.length}B → ${spillPath ? '落盘 ' + spillPath : '未落盘（写入失败，可重跑命令）'}`;
+  const note = `${MARKER} 已省略 ${dropped} 行 · 原文 ${raw.length}B → ${spillPath ? '落盘 ' + spillPath : '未落盘（原文过大或写入失败，可重跑命令）'}`;
   const parts = [head.slice(0, headKeep).join('\n'), note];
   if (strong.length) parts.push(`--- 命中标记行 (${strong.length}) ---`, strong.join('\n'));
   parts.push('--- 尾部 ---', tailFinal.join('\n'));
@@ -150,7 +153,7 @@ async function readCfg($: any): Promise<Cfg> {
 let seq = 0;
 
 async function spillRaw($: any, e: any, text: string, home: string): Promise<string | null> {
-  if (!home) return null;
+  if (!home || text.length > MAX_SPILL_CHARS) return null;
   try {
     let sid = 'nosid';
     try { sid = String(await $.session.id()).slice(0, 8); } catch { /* 默认 */ }
