@@ -1,0 +1,4 @@
+{
+  "description": "wb-bash-ops 0.1.0: Mods 通道（仅 modules，无 shell hooks——刻意不用 UserPromptSubmit/PostToolUse 子进程，见 README 事故分析）。",
+  "modules": ["./register.ts"]
+}
