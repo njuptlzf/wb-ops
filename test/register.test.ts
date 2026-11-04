@@ -5,7 +5,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { register, compress, compressList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix } from '../hooks/register.ts';
+import { register, compress, compressList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX } from '../hooks/register.ts';
 
 function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean } = {}) {
   const writes: { path: string; text: string }[] = [];
@@ -89,6 +89,62 @@ test('isError：透传', async () => {
   const h = harness({ env: HOME });
   const { r, out } = await h.bash(bigText(), {}, { isError: true });
   assert.equal(out, r);
+});
+
+// ---------------------------------------------------------------- Batch #2：错误 nextAction 提示
+
+test('已知错误+非零退出：现场原样 + 追加一行提示（小失败也提示——提示门在预算门之前）', async () => {
+  const h = harness({ env: HOME });
+  const raw = 'Command: xyz-cmd\n\nStdout:\n\nStderr:\nbash: xyz-cmd: command not found\n\nExit Code: 127';
+  const { r, out } = await h.bash(raw);
+  const got = (out as any).result as string;
+  assert.ok(got.startsWith(raw), '错误现场一字不动');
+  assert.ok(got.length > raw.length, '有提示');
+  assert.equal(got.split(HINT_PREFIX).length, 2, '至多一行');
+  assert.match(got, /命令不存在/);
+  assert.equal(h.writes.length, 0, '提示路径不落盘');
+});
+
+test('EADDRINUSE → 端口提示；中文「拒绝访问」→ 权限提示', async () => {
+  const h = harness({ env: HOME });
+  const { out: o1 } = await h.bash('Command: serve\nStderr:\nError: listen EADDRINUSE: address already in use :::3000\nExit Code: 1');
+  assert.match((o1 as any).result, /端口被占/);
+  const { out: o2 } = await h.call('PowerShell', 'Command: Remove-Item x\nStderr:\n访问路径拒绝访问。\nExit Code: 1', { input: { command: 'Remove-Item x' } });
+  assert.match((o2 as any).result, /权限不足/);
+});
+
+test('未知错误模式：恒等透传（宁缺毋滥，提示只在有把握时出现）', async () => {
+  const h = harness({ env: HOME });
+  const raw = 'Command: make\nStderr:\nsomething arcane went wrong\nExit Code: 2';
+  const { r, out } = await h.bash(raw);
+  assert.equal(out, r);
+});
+
+test('WB_OPS_HINTS=0：失败现场纯透传无提示', async () => {
+  const h = harness({ env: { ...HOME, WB_OPS_HINTS: '0' } });
+  const raw = 'Command: xyz\nStderr:\nbash: xyz: command not found\nExit Code: 127';
+  const { r, out } = await h.bash(raw);
+  assert.equal(out, r);
+});
+
+test('巨量失败输出：提示只扫头尾 4KB，中段埋雷不误报', async () => {
+  const h = harness({ env: HOME });
+  const raw = 'Command: big\n' + 'a'.repeat(4500) + '\ncommand not found (buried)\n' + 'b'.repeat(90000) + '\nExit Code: 1';
+  const { r, out } = await h.bash(raw);
+  assert.equal(out, r, '模式不在扫描窗内 → 不加提示也不压缩');
+});
+
+test('双压缩防护覆盖提示路径：已带标记的失败输出不再提示', async () => {
+  const h = harness({ env: HOME });
+  const raw = 'Command: xyz\nStderr:\nbash: xyz: command not found\n[wb-ops] 已省略 3 行\nExit Code: 127';
+  const { r, out } = await h.bash(raw);
+  assert.equal(out, r);
+});
+
+test('hintFor 单元：中英模式命中与未命中', () => {
+  assert.match(hintFor('fatal: not a git repository (or any of the parent directories): .git')!, /git/);
+  assert.match(hintFor('python: No module named requests')!, /pip install/);
+  assert.equal(hintFor('all quiet on the western front'), null);
 });
 
 test('双压缩防护：已带自身或 sana35421/wb-ops 真实标记的文本透传', async () => {

@@ -1,4 +1,4 @@
 {
-  "description": "wb-ops 0.3.0: Mods 通道（仅 modules，无 shell hooks——刻意不用 UserPromptSubmit/PostToolUse 子进程，见 README 事故分析）。",
+  "description": "wb-ops 0.4.0: Mods 通道（仅 modules，无 shell hooks——刻意不用 UserPromptSubmit/PostToolUse 子进程，见 README 事故分析）。",
   "modules": ["./register.ts"]
 }

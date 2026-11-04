@@ -2,11 +2,11 @@
 
 WorkBuddy 的**上下文治理 Mod**（Mod-first）：进程内 `tool.call` 中间件，在工具结果进入模型上下文之前做确定性压缩，原文落盘可回查。错误输出**永不压缩**。目标只有一个：**降本增效——让进入上下文的每一份 token 都携带高价值信息**。
 
-当前版本 v0.3 覆盖 **8 个高频出口**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（JSON 数组识别）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
+当前版本 v0.4 覆盖 **8 个高频出口**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（JSON 数组识别）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
 
 | 工具 | 策略 |
 |---|---|
-| Bash / PowerShell / TaskOutput | `Exit Code` 非零**完整透传**（遏制报错重试循环）；超预算压成 头+关键行+尾，尾段保底含退出码行 |
+| Bash / PowerShell / TaskOutput | `Exit Code` 非零**完整透传**并附一行 `[wb-ops 提示]`（9 类可识别错误→可执行下一步，模式只扫头尾 4KB；提示门在预算门之前，小失败也管）；超预算压成 头+关键行+尾，尾段保底含退出码行 |
 | Grep / Glob | 识别 WorkBuddy 的 JSON 字符串数组输出（实测 72 次调用全是这形状）：前 K 条 + 计数，整串原文落盘 `.json` |
 | Read | 按扩展名分档门槛：数据类（.log/.csv/.jsonl/…）>200 行才裁；.json/.md >800 行（≥40KB 的少行 dump 走硬阀）；**源码 <1500 行一律不裁**（读完多半要接着改，中段不能丢）。空洞 ≥20 行给 `回看: Read offset=N limit=M` 指路。宿主自己落的 `<persisted-output>` 不碰 |
 | WebFetch / WebSearch | 标题/链接/加粗行当骨架捞回，正文段省略 |
@@ -83,18 +83,19 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" --
 | `WB_OPS_BUDGET` | 8000 | 压缩后文本字节上限（>512 才生效）；与 sana 同名同义，共存时一个值管两边 |
 | `WB_OPS_DEADLINE_MS` | 100 | 压缩自设软超时；`0` 等效禁用压缩 |
 | `WB_OPS_STATS` | 关 | `1/on/true` 开启省量记账：每次成功压缩更新 `~/.workbuddy/wb-ops/stats/<sid8>.json`（整读整写小计数器，非无界追写；挂了不影响压缩，有单测钉死） |
+| `WB_OPS_HINTS` | 开 | `0/off/false/no` 关闭 shell 失败现场的 nextAction 提示（提示只加一行，不占压缩预算） |
 
 ## 开发 / 测试
 
 ```bash
-node --test test/register.test.ts   # 31 项，全绿（需 Node ≥22.6 的 --experimental-strip-types，或 Node 23+ 直接跑）
+node --test test/register.test.ts   # 38 项，全绿（需 Node ≥22.6 的 --experimental-strip-types，或 Node 23+ 直接跑）
 ```
 
 沙箱纪律：mods 内禁止 `node:require/process/global`（引擎会当场拒绝整个 mod），`register.ts` 唯一的 import 是 `codebuddy-code` 的**纯类型**导入，运行时被擦除。所有宿主能力走 `$`：`$.env` / `$.fs.write` / `$.session.id()`。
 
 ## 已验证 / 未验证
 
-- ✅ mods 加载（8 个 tool.call matcher 注册无报错，CLI 启动日志 `hooks: tool.call`）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略（离线 mock `$` 单测 31 项）
+- ✅ mods 加载（8 个 tool.call matcher 注册无报错，CLI 启动日志 `hooks: tool.call`）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复；离线 mock `$` 单测 38 项）
 - ✅ Grep/Glob 输出形状：从 86 条真实 transcript 确认 = JSON 字符串数组
 - ⚠️ **`tool.call` 事件里 `e.input` 的确切字段名**（代码候选 `input/tool_input/arguments` + `file_path/path/filePath`，判不出即透传，不会误伤）与 **`result` 的确切运行时形状**（四种已知形状自适配，未知即透传）——`/login` 后跑一次大输出闭环：
   ```bash

@@ -6,7 +6,8 @@
  * 设计规则（源自 sana35421/wb-ops 的 UserPromptSubmit 5s 超时事故分析，见 README）：
  *  1. 零子进程：只做 Mods 的 tool.call 中间件，不注册任何 shell hook。
  *  2. fail-open：未知形状、任何异常、超预算(时间/体积) —— 一律原样返回工具结果。
- *  3. 错误透传：isError 或 Exit Code 非零的输出不压缩（遏制报错重试循环，保完整现场）。
+ *  3. 错误透传：isError 或 Exit Code 非零的输出不压缩（保完整现场）；shell 失败现场另附一行
+ *     nextAction 提示（HINTS 表），对应 dsh-ops「报错重试循环」遏制原则——提示不是压缩，不加预算负担。
  *  4. 确定性策略：head/tail + 关键行 + 原文落盘（spill）带回查路径，热路径无 LLM。
  *  5. 并发安全：无共享可变状态文件；spill 文件名含 session/callId/序号，互不覆盖。
  *  6. 双压缩防护：已带本插件或 sana 版标记的文本不再处理。
@@ -76,7 +77,30 @@ const POLICY: Record<string, string> = {
   Read: 'read', WebFetch: 'doc', WebSearch: 'doc',
 };
 
-interface Cfg { enabled: boolean; budget: number; deadlineMs: number; home: string; stats: boolean; }
+/**
+ * 错误现场 nextAction 提示（dsh-ops 原则④「遏制报错重试循环」：一行可执行的下一步，
+ * 比模型盲目重跑省一整轮）。首中即停、至多一行；WB_OPS_HINTS=0 可关。
+ */
+export const HINT_PREFIX = '[wb-ops 提示] ';
+export const HINTS: Array<[RegExp, string]> = [
+  [/(command not found|not recognized as|No such command|不是内部或外部命令|无法将.+识别为)/i, '命令不存在：核对拼写，用 where.exe/Get-Command <命令> 确认 PATH'],
+  [/(permission denied|access is denied|EACCES|operation not permitted|拒绝访问)/i, '权限不足：确认是否需要提权或目标只读/被占用'],
+  [/(no such file or directory|ENOENT|找不到指定的路径|找不到文件)/i, '路径不存在：先 ls/pwd 确认 cwd 与目标路径拼写'],
+  [/(EADDRINUSE|address already in use|port .+already in use|端口.+占用)/i, '端口被占：netstat -ano | findstr <端口> 找 PID，处理占用进程后重试'],
+  [/(cannot find module|module not found|MODULE_NOT_FOUND)/i, '模块缺失：确认依赖已装（npm install）或入口路径正确'],
+  [/(ModuleNotFoundError|ImportError|No module named)/i, 'Python 包缺失：pip install 对应包，并确认虚拟环境已激活'],
+  [/(npm ERR! 404|404 Not Found|ENOTFOUND|getaddrinfo|ETIMEDOUT|ECONNREFUSED|ECONNRESET|Could not resolve host|连接(超时|失败))/i, '网络/源问题：检查代理与 DNS，或换 registry 重试'],
+  [/(not a git repository|fatal: not a git)/i, '不在 git 仓库内：cd 到项目根目录，确需新仓库再 git init'],
+  [/(exit code: 124|timed out)/i, '超时：拆小任务或加超时参数，先排查是否在等交互输入'],
+];
+/** 错误几乎总在头（命令回显后的 Stderr）或尾（Exit Code 前）；扫描限 4KB+4KB，10MB 输出也不拖慢。 */
+export function hintFor(raw: string): string | null {
+  const zone = raw.length <= 8000 ? raw : raw.slice(0, 4000) + '\n' + raw.slice(-4000);
+  for (const [re, hint] of HINTS) if (re.test(zone)) return hint;
+  return null;
+}
+
+interface Cfg { enabled: boolean; budget: number; deadlineMs: number; home: string; stats: boolean; hints: boolean; }
 type Sink = { put: (s: string) => unknown };
 export interface Compression { text: string; dropped: number; }
 
@@ -354,6 +378,7 @@ async function readCfg($: any): Promise<Cfg> {
     deadlineMs: deadline >= 0 ? deadline : DEFAULT_DEADLINE_MS,
     home,
     stats: /^(1|true|on|yes)$/i.test((await g('WB_OPS_STATS')).trim()),
+    hints: !/^(0|off|false|no)$/i.test((await g('WB_OPS_HINTS')).trim()),
   };
 }
 
@@ -418,6 +443,21 @@ function makeHandler(kind: string) {
       const t = extractText(r.result);
       if (!t) return r;
       const len = t.raw.length;
+
+      // shell 类：Exit Code 非零 → 现场完整透传（不压缩、不落盘），至多加一行 nextAction 提示。
+      // 特意放在预算/大小早退之前：失败输出多半不大，而"盲目重跑一整轮"恰恰发生在这些小现场上。
+      if (kind === 'shell') {
+        const codes = t.raw.slice(-2000).match(/Exit Code:\s*(-?\d+)/gi);
+        if (codes && codes.length) {
+          const last = parseInt(codes[codes.length - 1].replace(/.*?:\s*/, ''), 10);
+          if (Number.isFinite(last) && last !== 0) {
+            if (!cfg.hints || len > MAX_INPUT_BYTES || alreadyMarked(t.raw)) return r;
+            const h = hintFor(t.raw);
+            return h ? { ...r, result: t.sink.put(t.raw + '\n' + HINT_PREFIX + h) } : r;
+          }
+        }
+      }
+
       if (len > MAX_INPUT_BYTES) return r;        // 字节数 ≥ 字符数：字符都超限则字节必超，免全量扫描
       if (len * 3 < cfg.budget) return r;         // 每字符顶格 3 字节也进不了预算：免测
       const bytes = byteLen(t.raw);               // 预算是字节语义；字符数会放过「字符≤预算<字节」的中文串
@@ -430,16 +470,6 @@ function makeHandler(kind: string) {
         const path = toolPathOf(e);
         if (!path) return r;                 // 判不了文件类型：保守透传（源码被误伤比漏压贵）
         gate = classifyRead(path);
-      }
-
-      // shell 类：错误现场完整透传（尾部 Exit Code 非零）
-      if (kind === 'shell') {
-        const tail = t.raw.slice(-2000);
-        const codes = tail.match(/Exit Code:\s*(-?\d+)/gi);
-        if (codes && codes.length) {
-          const last = parseInt(codes[codes.length - 1].replace(/.*?:\s*/, ''), 10);
-          if (Number.isFinite(last) && last !== 0) return r;
-        }
       }
 
       const sid = await getSid8($);
