@@ -2,7 +2,7 @@
 
 WorkBuddy 的**上下文治理 Mod**（Mod-first）：进程内 `tool.call` 中间件，在工具结果进入模型上下文之前做确定性压缩，原文落盘可回查。错误输出**永不压缩**。目标只有一个：**降本增效——让进入上下文的每一份 token 都携带高价值信息**。
 
-当前版本 v0.4 覆盖 **8 个高频出口**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（JSON 数组识别）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
+当前版本 v0.5 覆盖 **8 个高频出口**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（JSON 数组识别）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）；开启记账后提供省量报表（会话内 `mcp__wb_ops__report` 工具 + 沙箱外 `node hooks/report.mjs`）。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
 
 | 工具 | 策略 |
 |---|---|
@@ -82,21 +82,22 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" --
 | `WB_OPS` | 开 | `0/off/false/no` 全局关闭 |
 | `WB_OPS_BUDGET` | 8000 | 压缩后文本字节上限（>512 才生效）；与 sana 同名同义，共存时一个值管两边 |
 | `WB_OPS_DEADLINE_MS` | 100 | 压缩自设软超时；`0` 等效禁用压缩 |
-| `WB_OPS_STATS` | 关 | `1/on/true` 开启省量记账：每次成功压缩更新 `~/.workbuddy/wb-ops/stats/<sid8>.json`（整读整写小计数器，非无界追写；挂了不影响压缩，有单测钉死） |
+| `WB_OPS_STATS` | 关 | `1/on/true` 开启省量记账：每次成功压缩更新 `~/.workbuddy/wb-ops/stats/<sid8>.json`（整读整写小计数器，非无界追写；挂了不影响压缩，有单测钉死）。开启后会话启动时注册 `mcp__wb_ops__report` 报表工具（不开不注册，不占 schema token）；沙箱外可跑 `node hooks/report.mjs` |
 | `WB_OPS_HINTS` | 开 | `0/off/false/no` 关闭 shell 失败现场的 nextAction 提示（提示只加一行，不占压缩预算） |
 
 ## 开发 / 测试
 
 ```bash
-node --test test/register.test.ts   # 38 项，全绿（需 Node ≥22.6 的 --experimental-strip-types，或 Node 23+ 直接跑）
+node --test test/register.test.ts   # 45 项，全绿（需 Node ≥22.6 的 --experimental-strip-types，或 Node 23+ 直接跑）
 ```
 
 沙箱纪律：mods 内禁止 `node:require/process/global`（引擎会当场拒绝整个 mod），`register.ts` 唯一的 import 是 `codebuddy-code` 的**纯类型**导入，运行时被擦除。所有宿主能力走 `$`：`$.env` / `$.fs.write` / `$.session.id()`。
 
 ## 已验证 / 未验证
 
-- ✅ mods 加载（8 个 tool.call matcher 注册无报错，CLI 启动日志 `hooks: tool.call`）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复；离线 mock `$` 单测 38 项）
+- ✅ mods 加载（8 个 tool.call matcher 注册无报错，CLI 启动日志 `hooks: tool.call`）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复）、报表聚合与渲染（谓词 matcher、坏文件跳过、list 抛错兜底、CLI 真目录聚合；离线 mock `$` 单测 45 项）
 - ✅ Grep/Glob 输出形状：从 86 条真实 transcript 确认 = JSON 字符串数组
+- ⚠️ **报表工具注册两处宿主未文档化点**：`$.tool.register` 返回值取 `.tool` 全名（bundle 源码如此，若返形状不符则报表工具不出现，主链路无损）；`$.fs.list` 条目形状未文档化（string/{name} 双兼容 + 抛错即空账本）。`/login` 后开 `WB_OPS_STATS=1` 看工具列表里有无 `mcp__wb_ops__report`。
 - ⚠️ **`tool.call` 事件里 `e.input` 的确切字段名**（代码候选 `input/tool_input/arguments` + `file_path/path/filePath`，判不出即透传，不会误伤）与 **`result` 的确切运行时形状**（四种已知形状自适配，未知即透传）——`/login` 后跑一次大输出闭环：
   ```bash
   # Bash 用例
