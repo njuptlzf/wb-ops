@@ -1,5 +1,5 @@
 /**
- * wb-bash-ops 离线单测：node --test test/
+ * wb-ops 离线单测：node --test test/
  * 用 mock 的 $（env/fs/session）驱动 register()，验证透传/压缩/落盘/并发/fail-open。
  * 不依赖 WorkBuddy——宿主真实行为另见 README「待在线验证」。
  */
@@ -50,7 +50,7 @@ test('超预算：压缩 + 落盘 + 关键行保留', async () => {
   const raw = bigText();
   const { out } = await h.call(raw);
   const got = (out as any).result as string;
-  assert.ok(got.includes('[wb-bash-ops]'), '有标记');
+  assert.ok(got.includes('[wb-ops]'), '有标记');
   assert.ok(got.includes('Command: npm test'), '头部保留');
   assert.ok(got.includes('ERROR: something exploded in module Y'), '强关键词行保留');
   assert.ok(got.includes('Exit Code: 0'), '尾部退出码保留');
@@ -58,7 +58,7 @@ test('超预算：压缩 + 落盘 + 关键行保留', async () => {
   assert.ok(got.length <= 8000 + 600 + 100, '预算上限内');
   assert.equal(h.writes.length, 1);
   assert.equal(h.writes[0].text, raw, '落盘的是完整原文');
-  assert.match(h.writes[0].path, /C:\/tmp-home\/\.workbuddy\/wb-bash-ops\/spill\/deadbeef\/\d+-c1\.txt$/);
+  assert.match(h.writes[0].path, /C:\/tmp-home\/\.workbuddy\/wb-ops\/spill\/deadbeef\/\d+-c1\.txt$/);
   assert.ok(got.includes(h.writes[0].path), '标记里给出回查路径');
 });
 
@@ -75,11 +75,11 @@ test('isError：透传', async () => {
   assert.equal(out, r);
 });
 
-test('双压缩防护：已带自身或 wb-ops 标记的文本透传', async () => {
+test('双压缩防护：已带自身或 sana35421/wb-ops 真实标记的文本透传', async () => {
   const h = harness({ env: HOME });
-  const a = await h.call('[wb-bash-ops] 已省略 3 行\n' + bigText());
+  const a = await h.call('[wb-ops] 已省略 3 行\n' + bigText());
   assert.equal(a.out, a.r);
-  const b = await h.call('[wb-ops] trimmed\n' + bigText());
+  const b = await h.call('[wb-ops 省略 999 行，可回查]\n' + bigText()); // sana trim.py MARK_OMIT 实际前缀
   assert.equal(b.out, b.r);
 });
 
@@ -88,23 +88,23 @@ test('落盘失败：仍压缩，但标记如实说明未保留', async () => {
   const { out } = await h.call(bigText());
   const got = (out as any).result as string;
   assert.ok(got.includes('未落盘'), '不给假路径');
-  assert.ok(got.includes('[wb-bash-ops] 已省略'));
+  assert.ok(got.includes('[wb-ops] 已省略'));
 });
 
-test('WB_BASH_OPS=0：全局关闭', async () => {
-  const h = harness({ env: { ...HOME, WB_BASH_OPS: '0' } });
+test('WB_OPS=0：全局关闭', async () => {
+  const h = harness({ env: { ...HOME, WB_OPS: '0' } });
   const { r, out } = await h.call(bigText());
   assert.equal(out, r);
 });
 
 test('软超时 deadlineMs=0：放弃压缩，透传原文', async () => {
-  const h = harness({ env: { ...HOME, WB_BASH_OPS_DEADLINE_MS: '0' } });
+  const h = harness({ env: { ...HOME, WB_OPS_DEADLINE_MS: '0' } });
   const { r, out } = await h.call(bigText());
   assert.equal(out, r);
 });
 
 test('自定义预算生效', async () => {
-  const h = harness({ env: { ...HOME, WB_BASH_OPS_BUDGET: '2000' } });
+  const h = harness({ env: { ...HOME, WB_OPS_BUDGET: '2000' } });
   const { out } = await h.call(bigText());
   assert.ok(((out as any).result as string).length <= 2000 + 700);
 });
@@ -117,7 +117,7 @@ test('content 数组形状保持替换', async () => {
   assert.equal(got.other, 42, '未触碰字段保留');
   assert.equal(got.content.length, 1);
   assert.equal(got.content[0].type, 'text');
-  assert.ok(got.content[0].text.includes('[wb-bash-ops]'));
+  assert.ok(got.content[0].text.includes('[wb-ops]'));
 });
 
 test('并发 50 次：spill 路径互不覆盖', async () => {

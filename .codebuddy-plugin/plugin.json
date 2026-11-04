@@ -1,6 +1,6 @@
 {
-  "name": "wb-bash-ops",
-  "version": "0.1.0",
-  "description": "WorkBuddy Bash 输出治理 Mod：进程内 tool.call 拦截，超预算输出确定性压缩 + 原文落盘回查。错误输出全量透传。零子进程，fail-open。",
+  "name": "wb-ops",
+  "version": "0.2.0",
+  "description": "WorkBuddy 上下文治理 Mod（Mod-first）：进程内 tool.call 拦截，超预算工具输出确定性压缩 + 原文落盘回查。错误输出全量透传。零子进程，fail-open。当前覆盖 Bash，后续拓展全生命周期事件。",
   "defaultEnabled": true
 }
