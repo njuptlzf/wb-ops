@@ -91,6 +91,13 @@ test('落盘失败：仍压缩，但标记如实说明未保留', async () => {
   assert.ok(got.includes('[wb-ops] 已省略'));
 });
 
+test('原文超过 4MB 落盘门槛：仍压缩但不写盘，标记如实说明', async () => {
+  const h = harness({ env: HOME });
+  const { out } = await h.call(bigText(45000)); // ≈4.6MB
+  assert.equal(h.writes.length, 0, '过大不写');
+  assert.ok(((out as any).result as string).includes('未落盘（原文过大'), '仍压缩，且诚实标注原因');
+});
+
 test('WB_OPS=0：全局关闭', async () => {
   const h = harness({ env: { ...HOME, WB_OPS: '0' } });
   const { r, out } = await h.call(bigText());
