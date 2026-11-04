@@ -5,9 +5,9 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { register, compress, compressList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, summarizeStats, renderSummary } from '../hooks/register.ts';
+import { register, compress, compressList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, summarizeStats, renderSummary, pickWatermark, guardNote, COMPACT_RETENTION } from '../hooks/register.ts';
 
-function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean; listFail?: boolean; list?: unknown[]; files?: Record<string, string> } = {}) {
+function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean; listFail?: boolean; list?: unknown[]; files?: Record<string, string>; usage?: unknown; usageFail?: boolean } = {}) {
   const writes: { path: string; text: string }[] = [];
   const reads: string[] = [];
   const byTool: Record<string, ($: any, e: any, next: any) => Promise<any>> = {};
@@ -18,6 +18,7 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
     byTool[m.tool] = h;
     hooks.push({ ev, matcher: m, h });
   }) as any);
+  const usageCalls: number[] = [];
   const $ = {
     env: { get: async (k: string) => opts.env?.[k] },
     tool: { register: async (spec: any) => { regCalls.push(spec); return { tool: 'mcp__wb_ops__report' }; } },
@@ -38,7 +39,24 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
         return hit ? hit.text : undefined;
       },
     },
-    session: { id: async () => 'deadbeef-0000-1111' },
+    session: {
+      id: async () => 'deadbeef-0000-1111',
+      usage: async () => {
+        usageCalls.push(1);
+        if (opts.usageFail) throw new Error('usage unavailable');
+        return opts.usage;
+      },
+    },
+  };
+  const firePrompt = async (text = '继续') => {
+    const hk = hooks.find((k) => k.ev === 'prompt.submit');
+    if (!hk) throw new Error('prompt.submit handler not registered');
+    return hk.h($, { text }, async (e: any) => ({ text: e.text }));
+  };
+  const fireCompact = async (e: Record<string, unknown> = { trigger: 'auto' }) => {
+    const hk = hooks.find((k) => k.ev === 'session.compact');
+    if (!hk) throw new Error('session.compact handler not registered');
+    return hk.h($, e, async (e2: any) => ({ passed: e2 }));
   };
   const fireSessionStart = async () => {
     const hk = hooks.find((k) => k.ev === 'session.start');
@@ -59,7 +77,7 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
   };
   const bash = (result: unknown, event: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) =>
     call('Bash', result, { input: { command: 'npm test' }, ...event }, extra);
-  return { $, writes, reads, call, bash, byTool, regCalls, fireSessionStart, callReport };
+  return { $, writes, reads, call, bash, byTool, regCalls, fireSessionStart, callReport, firePrompt, fireCompact, usageCalls };
 }
 
 const HOME = { USERPROFILE: 'C:/tmp-home' };
@@ -468,6 +486,70 @@ test('report 工具：stats 未开 → 提示文案', async () => {
   const h = harness({ env: HOME });
   const { out } = await h.callReport();
   assert.match(out.result, /报表未启用/);
+});
+
+// ---------------------------------------------------------------- guard (#4/#5)
+
+test('pickWatermark 候选形状与拒判', () => {
+  assert.deepEqual(pickWatermark({ used: 500, size: 1000 }), { used: 500, size: 1000 });
+  assert.deepEqual(pickWatermark({ inputTokens: 900, contextWindow: 1000 }), { used: 900, size: 1000 });
+  assert.deepEqual(pickWatermark({ promptTokens: 100, maxInputTokens: 200 }), { used: 100, size: 200 });
+  assert.equal(pickWatermark({ totalTokens: 300, size: 0 }), null);
+  assert.equal(pickWatermark(null), null);
+  assert.equal(pickWatermark(42), null);
+  assert.equal(pickWatermark({ used: '500', size: 1000 }), null, '字符串数字不收');
+  assert.equal(pickWatermark({ used: -1, size: 1000 }), null);
+});
+
+test('guardNote 阈值边界', () => {
+  assert.equal(guardNote({ used: 849, size: 1000 }, 85), null);
+  const n = guardNote({ used: 851, size: 1000 }, 85);
+  assert.ok(n && n.includes('[wb-ops 水位]') && n.includes('85%'));
+});
+
+test('prompt.submit 高水位 → text 保留 + context 附注', async () => {
+  const h = harness({ env: HOME, usage: { used: 90000, size: 100000 } });
+  const r = await h.firePrompt('继续');
+  assert.equal(r.text, '继续');
+  assert.equal(r.context.length, 1);
+  assert.match(r.context[0], /wb-ops 水位/);
+});
+
+test('prompt.submit 低水位 / 未知形状 / usage 抛错 → 恒等透传', async () => {
+  const h1 = harness({ env: HOME, usage: { used: 100, size: 100000 } });
+  assert.deepEqual(await h1.firePrompt('hi'), { text: 'hi' }, '低水位不得调 next 之外的改写');
+  const h2 = harness({ env: HOME, usage: { mystery: true } });
+  assert.deepEqual(await h2.firePrompt('hi'), { text: 'hi' });
+  const h3 = harness({ env: HOME, usageFail: true });
+  assert.deepEqual(await h3.firePrompt('hi'), { text: 'hi' }, 'usage 抛错 fail-open');
+});
+
+test('prompt.submit WB_OPS_GUARD=0 → 不调 usage', async () => {
+  const h = harness({ env: { ...HOME, WB_OPS_GUARD: '0' }, usage: { used: 99999, size: 100000 } });
+  assert.deepEqual(await h.firePrompt('hi'), { text: 'hi' });
+  assert.equal(h.usageCalls.length, 0, '关闭时连 usage() 都不碰');
+});
+
+test('prompt.submit 阈值可配 WB_OPS_GUARD_PCT=50', async () => {
+  const h = harness({ env: { ...HOME, WB_OPS_GUARD_PCT: '50' }, usage: { used: 60, size: 100 } });
+  const r = await h.firePrompt('hi');
+  assert.ok(Array.isArray(r.context) && r.context.length === 1, '60% 在 50% 阈值下必须提醒');
+});
+
+test('session.compact → instructions 追加保留优先级', async () => {
+  const h = harness({ env: HOME });
+  const r = await h.fireCompact({ trigger: 'auto', instructions: '宿主原始指示' });
+  assert.match(r.passed.instructions, /^宿主原始指示\n/);
+  assert.ok(r.passed.instructions.includes(COMPACT_RETENTION.slice(0, 12)));
+  const r2 = await h.fireCompact({ trigger: 'manual' });
+  assert.ok(!String(r2.passed.instructions).startsWith('\n'), '无原 instructions 时不带前导换行');
+});
+
+test('session.compact guard 关闭 → 原样', async () => {
+  const h = harness({ env: { ...HOME, WB_OPS_GUARD: 'off' } });
+  const e = { trigger: 'auto', instructions: 'keep' };
+  const r = await h.fireCompact(e);
+  assert.deepEqual(r.passed, e);
 });
 
 test('report.mjs CLI：真实目录聚合', async () => {
