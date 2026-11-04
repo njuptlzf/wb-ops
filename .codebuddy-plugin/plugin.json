@@ -1,6 +1,6 @@
 {
   "name": "wb-ops",
-  "version": "0.2.1",
-  "description": "WorkBuddy 上下文治理 Mod（Mod-first）：进程内 tool.call 拦截，超预算工具输出确定性压缩 + 原文落盘回查。错误输出全量透传。零子进程，fail-open。当前覆盖 Bash，后续拓展全生命周期事件。",
+  "version": "0.3.0",
+  "description": "WorkBuddy 上下文治理 Mod（Mod-first）：进程内 tool.call 拦截，超预算工具输出确定性压缩 + 原文落盘回查。v0.3 覆盖 Bash/PowerShell/TaskOutput/Grep/Glob/Read(分档)/WebFetch/WebSearch，UTF-8 字节预算。错误输出全量透传。零子进程，fail-open。",
   "defaultEnabled": true
 }
