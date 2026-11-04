@@ -5,28 +5,52 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { register, compress, compressList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX } from '../hooks/register.ts';
+import { register, compress, compressList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, summarizeStats, renderSummary } from '../hooks/register.ts';
 
-function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean } = {}) {
+function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean; listFail?: boolean; list?: unknown[]; files?: Record<string, string> } = {}) {
   const writes: { path: string; text: string }[] = [];
   const reads: string[] = [];
   const byTool: Record<string, ($: any, e: any, next: any) => Promise<any>> = {};
-  register(((ev: string, m: any, h: any) => { byTool[m.tool] = h; }) as any);
+  const hooks: Array<{ ev: string; matcher: any; h: any }> = [];
+  const regCalls: any[] = [];
+  register(((ev: string, m: any, h: any) => {
+    if (typeof m === 'function') { hooks.push({ ev, matcher: {}, h: m }); return; } // 2 参形态
+    byTool[m.tool] = h;
+    hooks.push({ ev, matcher: m, h });
+  }) as any);
   const $ = {
     env: { get: async (k: string) => opts.env?.[k] },
+    tool: { register: async (spec: any) => { regCalls.push(spec); return { tool: 'mcp__wb_ops__report' }; } },
     fs: {
       write: async (p: string, t: string) => {
         if (opts.writeFail) throw new Error('disk on fire');
         writes.push({ path: p, text: t });
       },
+      list: async (p: string) => {
+        if (opts.listFail) throw new Error('no such dir');
+        return opts.list ?? Object.keys(opts.files ?? {}).filter(f => f.startsWith(p + '/')).map(f => f.slice(p.length + 1));
+      },
       read: async (p: string) => {
         reads.push(p);
         if (opts.readFail) throw new Error('no such file');
+        if (opts.files?.[p] !== undefined) return opts.files[p];
         const hit = writes.find((w) => w.path === p);
         return hit ? hit.text : undefined;
       },
     },
     session: { id: async () => 'deadbeef-0000-1111' },
+  };
+  const fireSessionStart = async () => {
+    const hk = hooks.find((k) => k.ev === 'session.start');
+    return hk ? hk.h($, {}, async (e: any) => ({ passed: e })) : null;
+  };
+  const callReport = async () => {
+    const hk = hooks.find((k) => k.ev === 'tool.call' && typeof k.matcher.tool === 'function');
+    if (!hk) throw new Error('report handler not registered');
+    const name = 'mcp__wb_ops__report';
+    if (!hk.matcher.tool(name)) return { skipped: true as const };
+    const out = await hk.h($, { tool: name }, async () => { throw new Error('next must not run for own tool'); });
+    return { skipped: false as const, out };
   };
   const call = async (tool: string, result: unknown, event: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) => {
     const r = { result, ...extra };
@@ -35,7 +59,7 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
   };
   const bash = (result: unknown, event: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) =>
     call('Bash', result, { input: { command: 'npm test' }, ...event }, extra);
-  return { $, writes, reads, call, bash, byTool };
+  return { $, writes, reads, call, bash, byTool, regCalls, fireSessionStart, callReport };
 }
 
 const HOME = { USERPROFILE: 'C:/tmp-home' };
@@ -388,4 +412,88 @@ test('compressList 至少保 1 条', () => {
   const out = compressList(['x'.repeat(50000), 'b'], 8000, null, 60000);
   assert.ok(out.text.startsWith('x'.repeat(1000)), '首条按单行上限截断展示');
   assert.ok(out.text.includes('共 2 条'));
+});
+
+// ---------------------------------------------------------------- report (#3)
+
+test('renderSummary 空账本', () => {
+  assert.equal(summarizeStats([]).calls, 0);
+  assert.match(renderSummary([]), /还没有记账数据/);
+  assert.match(renderSummary([{ file: 'a.json', calls: 0, before: 0, after: 0 }]), /还没有记账数据/);
+});
+
+test('renderSummary 汇总行', () => {
+  const txt = renderSummary([
+    { file: 'aaaa1111.json', calls: 5, before: 40960, after: 8192, tool: 'shell', ts: '2026-11-04T10:00:00.000Z' },
+    { file: 'bbbb2222.json', calls: 2, before: 2048, after: 1024, tool: 'read', ts: '2026-11-03T10:00:00.000Z' },
+  ]);
+  assert.ok(txt.includes('压缩 7 次'));
+  assert.ok(txt.includes('42.0KB'), '合计原文 43008B');
+  assert.ok(txt.includes('(78.6%)'), 'saved 33792/43008');
+  assert.ok(txt.includes('aaaa1111  5 次'));
+  assert.ok(txt.indexOf('aaaa1111') < txt.indexOf('bbbb2222'), '按 ts 新→旧排');
+});
+
+test('stats 开启：session.start 注册 report 工具', async () => {
+  const h = harness({ env: { ...HOME, WB_OPS_STATS: '1' } });
+  const res = await h.fireSessionStart();
+  assert.deepEqual(res, { passed: {} }, '必须透传 next');
+  assert.equal(h.regCalls.length, 1);
+  assert.equal(h.regCalls[0].name, 'report');
+  assert.equal(typeof h.regCalls[0].description, 'string');
+  assert.equal(h.regCalls[0].inputSchema.type, 'object');
+});
+
+test('report 工具：读目录聚合渲染（谓词命中、next 不可达）', async () => {
+  const dir = 'C:/tmp-home/.workbuddy/wb-ops/stats';
+  const h = harness({
+    env: { ...HOME, WB_OPS_STATS: '1' },
+    list: ['aaaa1111.json', 'bad.json', 'notes.txt'],
+    files: { [`${dir}/aaaa1111.json`]: JSON.stringify({ calls: 3, before: 30000, after: 5000, tool: 'jsonlist', ts: '2026-11-04T09:00:00.000Z' }) },
+  });
+  const { skipped, out } = await h.callReport();
+  assert.equal(skipped, false);
+  assert.ok(out.result.includes('压缩 3 次'));
+  assert.ok(out.result.includes('jsonlist'), '最后 tool 字段透出');
+  assert.ok(!out.result.includes('bad'), '坏 JSON 行被跳过');
+});
+
+test('report 工具：fs.list 抛错 → 空账本文案（fail-open）', async () => {
+  const h = harness({ env: { ...HOME, WB_OPS_STATS: '1' }, listFail: true });
+  const { out } = await h.callReport();
+  assert.match(out.result, /还没有记账数据/);
+});
+
+test('report 工具：stats 未开 → 提示文案', async () => {
+  const h = harness({ env: HOME });
+  const { out } = await h.callReport();
+  assert.match(out.result, /报表未启用/);
+});
+
+test('report.mjs CLI：真实目录聚合', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { spawnSync } = await import('node:child_process');
+  const home = mkdtempSync(join(tmpdir(), 'wbops-cli-'));
+  try {
+    mkdirSync(join(home, '.workbuddy', 'wb-ops', 'stats'), { recursive: true });
+    writeFileSync(join(home, '.workbuddy', 'wb-ops', 'stats', 'sid1.json'), JSON.stringify({ calls: 2, before: 10000, after: 1500, tool: 'shell', ts: '2026-11-04T08:00:00.000Z' }));
+    writeFileSync(join(home, '.workbuddy', 'wb-ops', 'stats', 'sid2.json'), '{broken');
+    const r = spawnSync(process.execPath, [join(import.meta.dirname, '..', 'hooks', 'report.mjs')], {
+      encoding: 'utf8', env: { ...process.env, HOME: home, USERPROFILE: home },
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes('压缩 2 次'), r.stdout);
+    assert.ok(r.stdout.includes('sid1'), r.stdout);
+    // 空目录场景
+    rmSync(join(home, '.workbuddy', 'wb-ops', 'stats', 'sid1.json'));
+    const r2 = spawnSync(process.execPath, [join(import.meta.dirname, '..', 'hooks', 'report.mjs')], {
+      encoding: 'utf8', env: { ...process.env, HOME: home, USERPROFILE: home },
+    });
+    assert.equal(r2.status, 0);
+    assert.match(r2.stdout, /还没有记账数据|无记账目录/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

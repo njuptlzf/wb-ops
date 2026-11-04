@@ -419,6 +419,58 @@ async function recordStats($: any, home: string, sid: string, tool: string, befo
   } catch { /* 记账失败不影响主流程 */ }
 }
 
+// ------------------------------------------------------------------ report (#3)
+
+export interface StatRow { file: string; calls: number; before: number; after: number; tool?: string; ts?: string }
+
+export function summarizeStats(rows: StatRow[]): { calls: number; before: number; after: number } {
+  let calls = 0, before = 0, after = 0;
+  for (const r of rows) { calls += r.calls || 0; before += r.before || 0; after += r.after || 0; }
+  return { calls, before, after };
+}
+
+export function renderSummary(rows: StatRow[]): string {
+  const agg = summarizeStats(rows);
+  if (!agg.calls) return '[wb-ops] 还没有记账数据（需要 WB_OPS_STATS=1 且发生过压缩）';
+  const saved = agg.before - agg.after;
+  const pct = agg.before ? ((saved / agg.before) * 100).toFixed(1) : '0.0';
+  const kb = (n: number) => (n >= 1048576 ? (n / 1048576).toFixed(2) + 'MB' : (n / 1024).toFixed(1) + 'KB');
+  const lines = [
+    `[wb-ops 报表] 压缩 ${agg.calls} 次 · 原文 ${kb(agg.before)} → 压缩后 ${kb(agg.after)} · 省 ${kb(saved)} (${pct}%) · 记账会话 ${rows.length} 个`,
+    ...rows.sort((a, b) => (b.ts || '').localeCompare(a.ts || '')).slice(0, 12)
+      .map(r => `  ${r.file.replace(/\.json$/, '')}  ${r.calls} 次  ${kb(r.before)}→${kb(r.after)}  最后: ${r.tool || '?'} ${r.ts ? r.ts.slice(0, 10) : ''}`),
+    '  口径：只计本 Mod 实际改写的输出；被裁原文在 ~/.workbuddy/wb-ops/spill/ 可回查。',
+  ];
+  return lines.join('\n');
+}
+
+// register.ts 运行在 Mods 沙箱：无 Node 全局，$.fs.list 的条目形状宿主未文档化 → 归一化处理
+async function readStatRows($: any, dir: string): Promise<StatRow[]> {
+  let ents: unknown = [];
+  try {
+    ents = await $.fs.list(dir);
+  } catch {
+    return [];
+  }
+  const arr = Array.isArray(ents) ? ents : [];
+  const names: string[] = [];
+  for (const en of arr) {
+    if (typeof en === 'string') names.push(en);
+    else if (en && typeof (en as { name?: unknown }).name === 'string') names.push((en as { name: string }).name);
+  }
+  const rows: StatRow[] = [];
+  for (const name of names.filter(n => n.endsWith('.json')).slice(0, 500)) {
+    try {
+      const v = await $.fs.read(`${dir}/${name}`);
+      const txt = typeof v === 'string' ? v : v && typeof (v as { text?: unknown }).text === 'string' ? (v as { text: string }).text : '';
+      if (!txt) continue;
+      const j = JSON.parse(txt) as Record<string, number & string>;
+      rows.push({ file: name, calls: j.calls || 0, before: j.before || 0, after: j.after || 0, tool: j.tool, ts: j.ts });
+    } catch { /* 单文件坏不影响整体 */ }
+  }
+  return rows;
+}
+
 // ------------------------------------------------------------------ entry
 
 function toolPathOf(e: any): string | null {
@@ -498,8 +550,39 @@ function makeHandler(kind: string) {
   };
 }
 
+let reportToolName: string | null = null; // $.tool.register 返回值，形如 mcp__wb_ops__report
+
 export function register(on: On, _options?: unknown): void {
   for (const tool of Object.keys(POLICY)) {
     on('tool.call', { tool }, makeHandler(POLICY[tool]));
   }
+
+  // #3 报表：仅当用户开了 WB_OPS_STATS 才注册工具——不记账时不往提示词里塞 schema（token 经济自洽）
+  on('session.start', async ($: any, e: any, next: any) => {
+    try {
+      if (!reportToolName) {
+        const cfg = await readCfg($);
+        if (cfg.enabled && cfg.stats) {
+          const r = await $.tool.register({
+            name: 'report',
+            description: 'wb-ops 节省报表：各会话压缩次数、原文/压缩后字节、节省比例',
+            inputSchema: { type: 'object', properties: {} },
+          });
+          if (r && typeof r.tool === 'string') reportToolName = r.tool;
+        }
+      }
+    } catch { /* 注册失败只影响报表，不影响主链路 */ }
+    return next(e);
+  });
+
+  on('tool.call', { tool: (v: unknown) => !!reportToolName && v === reportToolName }, async ($: any, _e: any, _next: any) => {
+    try {
+      const cfg = await readCfg($);
+      if (!cfg.stats || !cfg.home) return { result: '[wb-ops] 报表未启用（设 WB_OPS_STATS=1 后重启会话）' };
+      const dir = `${cfg.home.replace(/\\/g, '/')}/.workbuddy/wb-ops/stats`;
+      return { result: renderSummary(await readStatRows($, dir)) };
+    } catch (err) {
+      return { result: `[wb-ops] 报表读取失败: ${String(err)}` }; // fail-open：工具本身不炸引擎
+    }
+  });
 }
