@@ -1,5 +1,6 @@
 /**
- * wb-bash-ops — WorkBuddy Mod：Bash 输出治理（进程内，确定性，fail-open）
+ * wb-ops — WorkBuddy Mod：工具输出治理（进程内，确定性，fail-open）
+ * v0.2 覆盖面：Bash；策略核心工具无关，后续按事件逐个拓展（所有烧 token 的出口）。
  *
  * 设计规则（源自 sana35421/wb-ops 的 UserPromptSubmit 5s 超时事故分析，见 README）：
  *  1. 零子进程：只做 Mods 的 tool.call 中间件，不注册任何 shell hook。
@@ -15,8 +16,10 @@
 
 import type { On } from 'codebuddy-code';
 
-const MARKER = '[wb-bash-ops]';
-const FOREIGN_MARKER = '[wb-ops]';           // sana35421/wb-ops 的标记，共存防双压
+const MARKER = '[wb-ops]';                   // 本 Mod 的标记（Mod-first 的 wb-ops）
+// sana35421/wb-ops（shell-hook 版）的真实标记前缀（trim.py L61-62），共存防双压。
+// 注意：它的标记是「[wb-ops 省略」带空格，与我们的「[wb-ops]」字面量互不误伤。
+const FOREIGN_MARKERS = ['[wb-ops 省略', '[wb-ops 以下为原文末尾'];
 
 const DEFAULT_BUDGET = 8000;                 // 最终文本长度上限（字符≈ASCII字节）
 const DEFAULT_DEADLINE_MS = 100;             // 压缩自设软超时；超时放弃，返回原文
@@ -58,6 +61,13 @@ export function extractText(res: unknown): { raw: string; sink: Sink } | null {
 
 // ------------------------------------------------------------------ policy
 
+/** 本 Mod 或 sana35421/wb-ops 已处理过的文本，不再二次压缩。 */
+function alreadyMarked(raw: string): boolean {
+  if (raw.indexOf(MARKER) >= 0) return true;
+  for (let i = 0; i < FOREIGN_MARKERS.length; i++) if (raw.indexOf(FOREIGN_MARKERS[i]) >= 0) return true;
+  return false;
+}
+
 /** 提取尾部 Exit Code；非零（或含外部标记/过小）时返回 null 表示不压缩。 */
 export function exitCodeOf(lines: string[]): number | null {
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -75,7 +85,7 @@ export function exitCodeOf(lines: string[]): number | null {
  */
 export function compress(raw: string, budget: number, deadlineMs: number, spillPath: string | null): Compression | null {
   if (raw.length <= budget) return null;
-  if (raw.indexOf(MARKER) >= 0 || raw.indexOf(FOREIGN_MARKER) >= 0) return null;
+  if (alreadyMarked(raw)) return null;
   const start = Date.now();
   const lines = raw.split('\n');
   const code = exitCodeOf(lines);
@@ -125,9 +135,9 @@ async function readCfg($: any): Promise<Cfg> {
   const g = async (k: string): Promise<string> => {
     try { return String((await $.env.get(k)) ?? ''); } catch { return ''; }
   };
-  const off = /^(0|off|false|no)$/i.test((await g('WB_BASH_OPS')).trim());
-  const budget = parseInt(await g('WB_BASH_OPS_BUDGET'), 10);
-  const deadline = parseInt(await g('WB_BASH_OPS_DEADLINE_MS'), 10);
+  const off = /^(0|off|false|no)$/i.test((await g('WB_OPS')).trim());
+  const budget = parseInt(await g('WB_OPS_BUDGET'), 10);
+  const deadline = parseInt(await g('WB_OPS_DEADLINE_MS'), 10);
   const home = (await g('USERPROFILE')) || (await g('HOME')) || '';
   return {
     enabled: !off,
@@ -146,7 +156,7 @@ async function spillRaw($: any, e: any, text: string, home: string): Promise<str
     try { sid = String(await $.session.id()).slice(0, 8); } catch { /* 默认 */ }
     const call = String(e?.callId ?? e?.call_id ?? Date.now()).replace(/[^\w.-]/g, '_').slice(0, 40);
     const name = `${(++seq) % 10000}-${call}.txt`;
-    const path = `${home.replace(/\\/g, '/')}/.workbuddy/wb-bash-ops/spill/${sid}/${name}`;
+    const path = `${home.replace(/\\/g, '/')}/.workbuddy/wb-ops/spill/${sid}/${name}`;
     await $.fs.write(path, text);
     return path;
   } catch {
@@ -169,7 +179,7 @@ export function register(on: On, _options?: unknown): void {
       const t = extractText(r.result);
       if (!t || t.raw.length <= cfg.budget) return r;
       // 压缩前廉价预判（避免为注定透传的输出白白 split/落盘）：
-      if (t.raw.indexOf(MARKER) >= 0 || t.raw.indexOf(FOREIGN_MARKER) >= 0) return r;
+      if (alreadyMarked(t.raw)) return r;
       const tail = t.raw.slice(-2000);
       const codes = tail.match(/Exit Code:\s*(-?\d+)/gi);
       if (codes && codes.length) {
