@@ -29,6 +29,7 @@ const FOREIGN_MARKERS = ['[wb-ops 省略', '[wb-ops 以下为原文末尾'];
 
 const DEFAULT_BUDGET = 8000;                 // 预算按 UTF-8 字节计（中文 3 字节≈1 token，按字符会漏）
 const DEFAULT_DEADLINE_MS = 100;             // 压缩自设软超时；超时放弃，返回原文
+const DEFAULT_GUARD_PCT = 85;                // 水位守卫阈值（%. usage 形状判不出即静默）
 const MAX_SPILL_CHARS = 4_000_000;           // 落盘写入门槛：超过不写（唯一的同步 IO 必须封顶）
 const MAX_INPUT_BYTES = 8_000_000;           // 超大输入一律透传（split 本身都不做）
 const LINE_MAX_BYTES = 1000;                 // 单行展示上限（防 minified 巨行吃满预算；sana MAX_LINE_BYTES）
@@ -100,7 +101,7 @@ export function hintFor(raw: string): string | null {
   return null;
 }
 
-interface Cfg { enabled: boolean; budget: number; deadlineMs: number; home: string; stats: boolean; hints: boolean; }
+interface Cfg { enabled: boolean; budget: number; deadlineMs: number; home: string; stats: boolean; hints: boolean; guard: boolean; guardPct: number; }
 type Sink = { put: (s: string) => unknown };
 export interface Compression { text: string; dropped: number; }
 
@@ -372,6 +373,7 @@ async function readCfg($: any): Promise<Cfg> {
   const budget = parseInt(await g('WB_OPS_BUDGET'), 10);
   const deadline = parseInt(await g('WB_OPS_DEADLINE_MS'), 10);
   const home = (await g('USERPROFILE')) || (await g('HOME')) || '';
+  const gpct = parseFloat(await g('WB_OPS_GUARD_PCT'));
   return {
     enabled: !off,
     budget: budget > 512 ? budget : DEFAULT_BUDGET,
@@ -379,6 +381,8 @@ async function readCfg($: any): Promise<Cfg> {
     home,
     stats: /^(1|true|on|yes)$/i.test((await g('WB_OPS_STATS')).trim()),
     hints: !/^(0|off|false|no)$/i.test((await g('WB_OPS_HINTS')).trim()),
+    guard: !/^(0|off|false|no)$/i.test((await g('WB_OPS_GUARD')).trim()),
+    guardPct: gpct > 0 && gpct < 100 ? gpct : DEFAULT_GUARD_PCT,
   };
 }
 
@@ -443,6 +447,29 @@ export function renderSummary(rows: StatRow[]): string {
   ];
   return lines.join('\n');
 }
+
+// ---------------------------------------------------------------- guard (#4/#5)
+
+// $.session.usage() 返回形状宿主未文档化（bundle 里同时存在 {used,size} 与 {inputTokens,contextWindow} 两种构造）
+// → 多字段候选；判不出返回 null，守卫静默（对齐 sana 事故的根治：无阻塞、无扫描、可整体关闭）
+export function pickWatermark(u: unknown): { used: number; size: number } | null {
+  if (!u || typeof u !== 'object') return null;
+  const o = u as Record<string, unknown>;
+  const num = (k: string): number | undefined =>
+    typeof o[k] === 'number' && Number.isFinite(o[k]) ? (o[k] as number) : undefined;
+  const used = num('used') ?? num('inputTokens') ?? num('promptTokens') ?? num('totalTokens');
+  const size = num('size') ?? num('contextWindow') ?? num('maxInputTokens');
+  if (used === undefined || size === undefined || size <= 0 || used < 0) return null;
+  return { used, size };
+}
+
+export function guardNote(w: { used: number; size: number }, pct: number): string | null {
+  const p = (w.used / w.size) * 100;
+  if (p < pct) return null;
+  return `[wb-ops 水位] 上下文约 ${p.toFixed(0)}%（${w.used}/${w.size} tok）。接近上限时宿主将有损压缩；建议本轮起：大输出命令自带 head/过滤、探索合并成批、避免整读大文件。wb-ops 已把每次越线输出压回预算内。`;
+}
+
+export const COMPACT_RETENTION = '[wb-ops] 压缩保留优先级：错误/警告行原文、文件路径+行号、[wb-ops] 标记及其落盘路径、最近 3 条用户指令原文；其余可安全摘要。';
 
 // register.ts 运行在 Mods 沙箱：无 Node 全局，$.fs.list 的条目形状宿主未文档化 → 归一化处理
 async function readStatRows($: any, dir: string): Promise<StatRow[]> {
@@ -584,5 +611,36 @@ export function register(on: On, _options?: unknown): void {
     } catch (err) {
       return { result: `[wb-ops] 报表读取失败: ${String(err)}` }; // fail-open：工具本身不炸引擎
     }
+  });
+
+  // #4 水位守卫：每轮用户提交查一次 $.session.usage()（进程内 O(1)，非 sana 那种 16MB transcript 尾扫）
+  // 越线才改写：契约 {text, context:string[]}，context 数组随 prompt 进模型（bundle @2099903 合并逻辑）
+  on('prompt.submit', async ($: any, e: any, next: any) => {
+    try {
+      const cfg = await readCfg($);
+      if (cfg.enabled && cfg.guard) {
+        const w = pickWatermark(await $.session.usage());
+        const note = w ? guardNote(w, cfg.guardPct) : null;
+        if (note) {
+          const r = await next(e);
+          const text = r && typeof r.text === 'string' ? r.text : String(e?.text ?? '');
+          const ctx: string[] = Array.isArray(r?.context) ? r.context : [];
+          return { text, context: [...ctx, note] };
+        }
+      }
+    } catch { /* 形状未知/usage 抛错 → 透传 */ }
+    return next(e);
+  });
+
+  // #5 压缩保留指示：session.compact 事件带 instructions（bundle @1704343），next 前改写 = Mod 版 PreCompact
+  on('session.compact', async ($: any, e: any, next: any) => {
+    try {
+      const cfg = await readCfg($);
+      if (cfg.enabled && cfg.guard) {
+        const base = typeof e?.instructions === 'string' && e.instructions ? e.instructions + '\n' : '';
+        return next({ ...e, instructions: base + COMPACT_RETENTION });
+      }
+    } catch { /* 透传 */ }
+    return next(e);
   });
 }
