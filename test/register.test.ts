@@ -578,6 +578,48 @@ test('② 水位数值文件：写失败 → 提醒仍在但无路径，不炸',
   assert.ok(!note.includes('余量速查'), '路径未承诺');
 });
 
+test('② 记账未开启 → 水位文件仍写（跟 guard 走），但不产生记账 IO', async () => {
+  const h = harness({ env: { ...HOME, WB_OPS_STATS: '0' }, usage: { used: 1000, size: 20000 } });
+  const res = await h.firePrompt();
+  assert.ok(h.writes.some((w) => w.path.endsWith('/wb-ops/watermark/deadbeef.num')), '水位文件跟 guard 走');
+  assert.ok(!h.writes.some((w) => w.path.includes('/stats/')) && !h.reads.some((r) => r.includes('/stats/')), 'stats 关则零记账 IO');
+  assert.ok(!((res.context || []).length), '5% 不越线不发提醒');
+});
+
+test('④ install-gui.mjs：临时 HOME 装+卸，known/installed 形状正确', async () => {
+  const { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, mkdirSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { spawnSync } = await import('node:child_process');
+  const home = mkdtempSync(join(tmpdir(), 'wbops-gui-'));
+  try {
+    // 预置一个别的市场条目，验证合并不覆盖
+    const pluginsDir = join(home, '.workbuddy', 'plugins');
+    mkdirSync(pluginsDir, { recursive: true });
+    writeFileSync(join(pluginsDir, 'known_marketplaces.json'), JSON.stringify({ other: { manifestName: 'other', type: 'directory', source: { source: 'directory', path: 'X:\\keep' }, installLocation: 'X:\\keep', autoUpdate: true } }, null, 2));
+    const script = join(import.meta.dirname!, '..', 'scripts', 'install-gui.mjs');
+    const r1 = spawnSync(process.execPath, [script], { env: { ...process.env, WB_OPS_INSTALL_HOME: home.replace(/\\/g, '/') } });
+    assert.equal(r1.status, 0, r1.stderr?.toString());
+    const known = JSON.parse(readFileSync(join(pluginsDir, 'known_marketplaces.json'), 'utf8'));
+    assert.ok(known.other, '既有市场保留');
+    assert.equal(known['wb-ops-local'].type, 'directory');
+    const inst = JSON.parse(readFileSync(join(pluginsDir, 'installed_plugins.json'), 'utf8'));
+    const entry = inst.plugins['wb-ops@wb-ops-local'][0];
+    assert.equal(entry.scope, 'user');
+    assert.ok(entry.version && /^\d+\.\d+\.\d+/.test(entry.version), entry.version);
+    assert.ok(existsSync(join(entry.installPath.replace(/\\\\/g, '\\'), 'hooks', 'register.ts')), 'cache 里有 payload');
+    assert.ok(existsSync(join(pluginsDir, 'marketplaces', 'wb-ops-local', 'wb-ops', '.codebuddy-plugin', 'plugin.json')), 'marketplaces 目录结构');
+    const r2 = spawnSync(process.execPath, [script, '--uninstall'], { env: { ...process.env, WB_OPS_INSTALL_HOME: home.replace(/\\/g, '/') } });
+    assert.equal(r2.status, 0, r2.stderr?.toString());
+    const known2 = JSON.parse(readFileSync(join(pluginsDir, 'known_marketplaces.json'), 'utf8'));
+    assert.ok(known2.other && !known2['wb-ops-local'], '卸载只摘自己');
+    const inst2 = JSON.parse(readFileSync(join(pluginsDir, 'installed_plugins.json'), 'utf8'));
+    assert.ok(!inst2.plugins['wb-ops@wb-ops-local']);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('pickWatermark 候选形状与拒判', () => {
   assert.deepEqual(pickWatermark({ used: 500, size: 1000 }), { used: 500, size: 1000 });
   assert.deepEqual(pickWatermark({ inputTokens: 900, contextWindow: 1000 }), { used: 900, size: 1000 });
