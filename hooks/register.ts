@@ -944,7 +944,16 @@ export function register(on: On, _options?: unknown): void {
       const cfg = await readCfg($);
       if (cfg.enabled && cfg.guard) {
         const base = typeof e?.instructions === 'string' && e.instructions ? e.instructions + '\n' : '';
-        return next({ ...e, instructions: base + COMPACT_RETENTION });
+        const merged = base + COMPACT_RETENTION;
+        // 诊断：只记长度与是否含保留指示，不记正文（与 usage/fsprobe 同口径）
+        await writeDebug($, cfg.home, await getSid8($), 'compact', {
+          trigger: typeof e?.trigger === 'string' ? e.trigger : undefined,
+          hadBase: !!base,
+          baseLen: base.length,
+          mergedLen: merged.length,
+          hasRetention: merged.includes(COMPACT_RETENTION),
+        });
+        return next({ ...e, instructions: merged });
       }
     } catch { /* 透传 */ }
     return next(e);
