@@ -2,7 +2,7 @@
 
 WorkBuddy 的**上下文治理 Mod**（Mod-first）：进程内 `tool.call` 中间件，在工具结果进入模型上下文之前做确定性压缩，原文落盘可回查。错误输出**永不压缩**。目标只有一个：**降本增效——让进入上下文的每一份 token 都携带高价值信息**。
 
-当前版本 v0.12 覆盖 **8 个高频出口 + 通配兜底**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（宿主原生字符串数组 + JSON 数组文本两种形态）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）；开启记账后提供省量报表（会话内 `mcp__wb_ops__report` 工具 + 沙箱外 `node hooks/report.mjs`，按工具类型细分 分类 行）；上下文水位守卫（prompt.submit ≥85% 一行提醒）与压缩保留指示（session.compact instructions，Mod 版 PreCompact）；POLICY 之外的所有工具名（MCP、宿主新增）由谓词 matcher 兜底走通用压缩。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
+当前版本 v0.13 覆盖 **8 个高频出口 + 通配兜底**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（宿主原生字符串数组 + JSON 数组文本两种形态）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）；开启记账后提供省量报表（会话内 `mcp__wb_ops__report` 工具 + 沙箱外 `node hooks/report.mjs`，按工具类型细分 分类 行；**v0.13 起默认开**，每次压缩的标记行还内联 `≈N tok → ≈M tok（省 P%）`）；上下文水位守卫（prompt.submit ≥85% 一行提醒）与压缩保留指示（session.compact instructions，Mod 版 PreCompact）；POLICY 之外的所有工具名（MCP、宿主新增）由谓词 matcher 兜底走通用压缩。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
 
 | 工具 | 策略 |
 |---|---|
@@ -61,7 +61,7 @@ WorkBuddy 的**上下文治理 Mod**（Mod-first）：进程内 `tool.call` 中�
 - 中部关键行（error/fatal/traceback/错误/失败/警告/异常/… 中英并集，至多 40 条，超出均匀撒点；连续一段等于没省）
 - 自适应尾部（保底含 `Exit Code:` 行）
 - 少行巨字节特例：整串行数 ≤20（minified、单行 JSON dump）走字节级首 60%+尾 28% 截断，不会一裁就没
-- 一行标记：`[wb-ops] 已省略 N 行 · 原文 Xb → 落盘 ~/.workbuddy/wb-ops/spill/<sid8>/<seq>-<callId>.txt`
+- 一行标记：`[wb-ops] 已省略 N 行 · 原文 12.4KB≈4.1k tok → ≈1.2k tok（省 71%） · 落盘 ~/.workbuddy/wb-ops/spill/<sid8>/<seq>-<callId>.txt`
 
 模型需要细节时用 Read/Grep 读 spill 路径（Read 档还给 offset/limit 指路）。已带 `[wb-ops]` 或 sana 标记前缀的文本不再二次压缩。
 
@@ -128,6 +128,25 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" pl
 
 想知道**为什么信得过这个插件**（验证流程、原始数据、复现命令），见 [VERIFICATION.md](VERIFICATION.md)——v0.12.0 三项验收与 v0.12.1 大文件降级的全部真机证据都在里面，包括两条可复用的宿主验证通道（settings.json env 注入、CLI 固定 sid + 预置 transcript）。
 
+## 怎样看到省了多少（v0.13）
+
+token 数是**估算**，公式与宿主 `TokenUtils.estimateTokensRough` 逐字相同：`ceil(中文/1.8) + ceil(其余字符/4)`（`estTokens`，与 wb 自己的计数同源）。压缩决策仍按字节——字节是保守上界，token 只用于展示。
+
+| 想看的 | 怎么做 | 在哪显示 |
+|---|---|---|
+| 单次压缩省了多少 | 不用做：每次压缩的 `[wb-ops]` 标记行自带 `原文 …≈N tok → ≈M tok（省 P%）` | 就在 wb 对话的工具结果里 |
+| 本机累计（按工具类型细分） | 在新会话说「调 `mcp__wb_ops__report`」，或沙箱外 `node hooks/report.mjs` | wb 聊天 / 终端 |
+| 原始记账数据 | `~/.workbuddy/wb-ops/stats/<sid8>.json`：`{calls,before,after,tokBefore,tokAfter,kinds}` | 文件 |
+
+报表长这样：
+
+```
+[wb-ops 报表] 压缩 7 次 · 省 ≈8.4k tok / 33.0KB (78.6%) · 原文 42.0KB≈10.8k tok → 压缩后 8.0KB≈2.4k tok · 记账会话 2 个
+  分类：shell 5次 ≈7.2k→1.1k tok · jsonlist 2次 ≈3.6k→1.3k tok
+```
+
+记账 **v0.13 起默认开**（`WB_OPS_STATS=0/off/false/no` 关）：每次压缩多一对小 JSON 读写（约 1KB），会话启动多注册一个 `mcp__wb_ops__report` 工具（schema 约百余 token）。嫌贵就设 `WB_OPS_STATS=0`——标记行里的内联 token 数字不受影响，仍随时可见。
+
 ## 配置（环境变量，经 `$.env.get` 读取）
 
 | 变量 | 默认 | 说明 |
@@ -135,7 +154,7 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" pl
 | `WB_OPS` | 开 | `0/off/false/no` 全局关闭 |
 | `WB_OPS_BUDGET` | 4500 | 压缩后文本字节上限（>512 才生效）；与 sana 同名同义，共存时一个值管两边。**v0.11 由 8000 下调**：宿主 `persisted-output` 落盘阈值实测 ≈8KB，预算贴死阈值会让 mod 的可压缩区间被宿主抢走，4500 留 ~45% 余量 |
 | `WB_OPS_DEADLINE_MS` | 100 | 压缩自设软超时；`0` 等效禁用压缩 |
-| `WB_OPS_STATS` | 关 | `1/on/true` 开启省量记账：每次成功压缩更新 `~/.workbuddy/wb-ops/stats/<sid8>.json`（整读整写小计数器，含按工具类型细分的 `kinds` 字段，非无界追写；挂了不影响压缩，有单测钉死）。开启后会话启动时注册 `mcp__wb_ops__report` 报表工具（不开不注册，不占 schema token）；沙箱外可跑 `node hooks/report.mjs` |
+| `WB_OPS_STATS` | 开 | **v0.13 默认开**。`0/off/false/no` 关闭省量记账：每次成功压缩更新 `~/.workbuddy/wb-ops/stats/<sid8>.json`（整读整写小计数器，含按工具类型细分的 `kinds` 与 token 口径 `tokBefore/tokAfter`，非无界追写；挂了不影响压缩，有单测钉死）。开启后会话启动时注册 `mcp__wb_ops__report` 报表工具；沙箱外可跑 `node hooks/report.mjs`。关掉只少了累计报表，标记行的内联 token 数字照旧 |
 | `WB_OPS_HINTS` | 开 | `0/off/false/no` 关闭 shell 失败现场的 nextAction 提示（提示只加一行，不占压缩预算） |
 | `WB_OPS_GUARD` | 开 | `0/off/false/no` 同时关闭 #4 水位守卫（prompt.submit 提醒）与 #5 压缩保留指示（session.compact instructions）。守卫进程内读取，**无子进程**（v0.12 起 usage 恒 0 时有界尾部采样，见下） |
 | `WB_OPS_FALLBACK` | 开 | `0/off/false/no` 关闭 ③ 通配兜底（只保留 8 个白名单出口） |
@@ -187,10 +206,10 @@ bash test/run-acceptance.sh <合法UUID> "验收" WB_OPS_GUARD_PCT=10   # 真机
 ## 已验证 / 未验证
 
 - ✅ **③ 通配兜底的谓词 matcher（2026-11-05 真机闭环）**：`domain_search` 输出 52.1KB → 兜底压缩生效（头部 + `命中关键行` + 尾部，`[+NNNNB]` 单行截断正常）。函数谓词每次事件重评、路由真实生效。
-- ✅ mods 加载（CLI 启动日志 `hooks: tool.call session.start prompt.submit session.compact` 四通道全注册）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复）、报表聚合与渲染（谓词 matcher、坏文件跳过、list 抛错兜底、CLI 真目录聚合）、水位守卫与压缩保留指示（形状候选/阈值边界/关闭零触碰/fail-open）、③ 通配兜底（预算内零影响/非零透传/可关/谓词互斥）、① by-kind 分类账本（kinds 写入/聚合/渲染、无 kinds 老账本兼容）、② 水位数值文件（每轮小写/越线附带 Read 路径/写失败静默/stats-off 仍跟 guard）、④ GUI 安装助手（临时 HOME 装+卸、known/installed 形状、既有市场保留、cache payload 落地）、v0.11 形状诊断通道（只记结构/只记长度/限频/小输出不打扰）、v0.12 水位数据源（嵌套 context 候选/tokens=0 静默/transcript 尾部逆扫/权限探测/目录兜底/可关）——离线 mock API 单测 **91 项全绿**
+- ✅ mods 加载（CLI 启动日志 `hooks: tool.call session.start prompt.submit session.compact` 四通道全注册）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复）、报表聚合与渲染（谓词 matcher、坏文件跳过、list 抛错兜底、CLI 真目录聚合）、水位守卫与压缩保留指示（形状候选/阈值边界/关闭零触碰/fail-open）、③ 通配兜底（预算内零影响/非零透传/可关/谓词互斥）、① by-kind 分类账本（kinds 写入/聚合/渲染、无 kinds 老账本兼容）、② 水位数值文件（每轮小写/越线附带 Read 路径/写失败静默/stats-off 仍跟 guard）、④ GUI 安装助手（临时 HOME 装+卸、known/installed 形状、既有市场保留、cache payload 落地）、v0.11 形状诊断通道（只记结构/只记长度/限频/小输出不打扰）、v0.12 水位数据源（嵌套 context 候选/tokens=0 静默/transcript 尾部逆扫/权限探测/目录兜底/可关）、v0.13 token 口径（估算公式/标记行内联省比/记账 tok 字段/默认开/关掉零 IO）——离线 mock API 单测 **94 项全绿**
 - ✅ Grep/Glob 输出形状：从 86 条真实 transcript 确认 = JSON 字符串数组；**2026-11-05 真机再测发现宿主原生形态是 `content: string[]`**（不是 JSON 文本）→ v0.11 已适配（单测钉死：裁条目+单行说明、保持数组形态、预算内零影响、混合类型仍 fail-open）
 - ✅ **真机压缩闭环（2026-11-05 GUI 会话，pid 72880）**：Bash 13.2KB / PowerShell 14.9KB / TaskOutput 30.4KB / Read .log 24.5KB（含 `回看: Read offset=34 limit=180` 空洞指路）/ MCP 兜底 52.1KB / 错误现场 Exit Code 2 完整透传 + `[wb-ops 提示]` 一行 / 预算内零影响 / Read .ts 682 行原样不裁——5 次 spill 落盘 135KB
-- ⚠️ **报表工具注册两处宿主未文档化点**：`$.tool.register` 返回值取 `.tool` 全名（bundle 源码如此，若返形状不符则报表工具不出现，主链路无损）；`$.fs.list` 条目形状未文档化（string/{name} 双兼容 + 抛错即空账本）。开 `WB_OPS_STATS=1` 后新开会话看工具列表里有无 `mcp__wb_ops__report`。
+- ⚠️ **报表工具注册两处宿主未文档化点**：`$.tool.register` 返回值取 `.tool` 全名（bundle 源码如此，若返形状不符则报表工具不出现，主链路无损）；`$.fs.list` 条目形状未文档化（string/{name} 双兼容 + 抛错即空账本）。开 `WB_OPS_STATS`（v0.13 默认开）后新开会话看工具列表里有无 `mcp__wb_ops__report`。
 - ✅ **v0.12 水位数据源根因已实锤（2026-11-05 bundle 反查）**：`$.session.usage()` 的真实实现是宿主 `createModsUsageBinding`，返回 `{context:{tokens,window,percent},rateLimits:[]}`（**没有 ` {value:…}` 包装层，之前的猜测作废**）。`window` 由 `resolveSessionContextBudget` 真算（本会话 300000，可信）；`tokens = getCurrentContextUsage(session)?.totalInputTokens ?? 0`，而 mods 持有的 session 上 `getLatestUsageSnapshot` 缺失 ⇒ **恒 0**。数据本身健康：transcript JSONL 每条模型响应都带 `providerData.usage.inputTokens`（实测单调 31737→71198，已含 cache_read），宿主 ACP 的 `usage_update` 也用 `getLatestUsage()?.inputTokens`。**断点在宿主 mods 绑定层，不在数据源**——可向宿主报 issue。
   v0.12 对策：`pickWatermark` 认嵌套 `context.tokens/window`（宿主修好后自动点亮，`tokens=0` 仍静默）；否则走 transcript 尾部采样取 used、window 仍用 `usage().context.window`；读权限探测落 `debug/fsprobe-<sid8>.json`。**待真机确认**：mod 沙箱 `$.fs` 能否读 `<HOME>/.workbuddy/projects/`（若被拒，看 fsprobe 的 err，守卫继续保持静默）。
 - ⚠️ **宿主 `persisted-output` 阈值 ≈8KB 是硬天花板**：超过它宿主先落盘，mod 看不到原文（README 明确"宿主落的 persisted-output 不碰"）。所以 mod 的实际收益上限 = (预算, 8KB) 区间 + 宿主未落盘的其余工具。v0.11 预算降到 4500 正是为了把这块区间吃满。
@@ -252,3 +271,19 @@ bash test/run-acceptance.sh <合法UUID> "验收" WB_OPS_GUARD_PCT=10   # 真机
 **实测代价可接受**：22MB 全量 `readFile` + `toString` + `split` 共 **115ms**、常驻内存 134MB，且只在 `prompt.submit` 每轮一次。
 
 **真机验收**：用真实 21.5MB 会话文件跑 mod → `fsprobe` 得 `{"used":410003,"bytes":22666447,"truncated":true}`、`watermark` 标「来源 transcript」，与全文解析结果**完全一致**；旧错误 `transcript too big` 归零。
+
+---
+
+## v0.13 变更（2026-11-05）—— token 指标：省了多少，一眼可见
+
+**目标**：把"省了多少"从字节换算成人人认得的 token，并让它出现在 wb 对话里，而不是要求用户先配环境变量再翻文件。
+
+| 改动 | 说明 |
+|---|---|
+| `estTokens` | 与宿主 `TokenUtils.estimateTokensRough` 逐字同公式：`ceil(中文/1.8)+ceil(其余/4)`；只用于展示，压缩决策仍按字节 |
+| 标记行内联省量 | `[wb-ops] 已省略 N 行 · 原文 12.4KB≈4.1k tok → ≈1.2k tok（省 71%） · 落盘 …`，shell / Read / 列表 / 兜底四条路径统一走 `markerNote` |
+| 记账带 token | `stats/<sid8>.json` 增 `tokBefore/tokAfter`（`kinds` 每类也有）；老账本缺字段时报表自动回落字节口径 |
+| 报表两处同源 | `renderSummary`（`mcp__wb_ops__report`）与 `hooks/report.mjs` 首行都给"省 ≈X tok / YKB (P%)"，分类行同口径 |
+| 默认开 | `WB_OPS_STATS` 默认开，`0/off/false/no` 关；关掉后标记行 token 照旧，只少累计报表 |
+
+**未做**：WorkBuddy GUI 没有插件可用的 statusline（`statusLine` 只在 CLI TUI 的 settings.json 生效），故不做常驻栏——标记行 + 报表工具已覆盖"看得到"。
