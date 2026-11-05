@@ -14,4 +14,10 @@
   - **CLI 可跑「固定 sid + 预置 transcript」验收**：鉴权门在 `AgentService.run()` 之前，**prompt.submit 已执行** → mod 的 guard/watermark 链路在 CLI 无鉴权下可真机验证；`--session-id <uuid>` 固定 sid + 预置 `~/.workbuddy/projects/<slug>/<sid>.jsonl`（含 `providerData.usage.inputTokens`）即可**确定性控制水位**。CLI 跑不了模型回合 → LLM 摘要路径到不了，但「工程压缩」下压缩照样完成（history trimmed 15->1）。
   - 验收结论：① fsprobe ok（真实会话 used=186721；f87c445e 因 9.9MB 超 8MB 上限被拒 → **8MB 上限偏小，长会话 fallback 会失效，待修**）；② [wb-ops 水位] 真实注入 5 次，watermark 标「来源 transcript」（构造会话 100% + 真实会话 42.4% 两条路径都通）；③ 真 auto-compact（compactType=pre-message-auto / compactionTrigger=pre_message_threshold）时 mod 的 COMPACT_RETENTION 合并成功（新增 debug/compact-<sid8>.json 诊断）。
   - **修正旧结论**：宿主 usage tokens 并非恒 0——多个 GUI 会话实测 0→56339→98744→124720 持续增长（旧「mods 绑定恒 0」只在会话最初几轮成立）→ usage 路径与 transcript fallback 两条路互补，pickWatermark 嵌套候选有效。
+- 2026-11-05 v0.12.1 **修掉 8MB 上限的真实风险**（commit 802458a，已装真实 HOME 0.12.1，单测 91/91）：
+  - **根因（真机数据）**：usage 归零的精确时刻 = **pre-message-auto compact 之后**（实测 compact 摘要落盘 → **8.2 秒后** usage 才恢复）；而宿主 transcript **只增不减**（真实会话实测 21.5MB）。长会话里两个条件必然同时撞上 → 旧实现 >8MB 判 `transcript too big` → 该窗口内 fallback 永久失守 → **水位提醒彻底静默**（fail-open，表现为"没提醒"而非报错）。
+  - ⚠️ 进一步修正：usage 路径才是**主力**（tokens 实测涨到 306324/410003），fallback 只在 compact 后那 8 秒窗口起作用——而那正是旧上限失守的窗口。两者不是"互补"而是"串行接力"。
+  - **修法**：`probeTranscript` >8MB 不再整体拒绝 → 整读后只解析尾部 ≤4M 字符 + `fs.stat` 预判体积 + debug 标 `truncated`；`lastInputTokens(txt, from)` 支持分段起点。实测 22MB 全量读 **115ms / 内存 134MB**（只在 prompt.submit 每轮一次，代价可接受）；沙箱 `fs.read` **无 offset**（底层 readFile）→ 无法只读尾部。
+  - **真机验收**（真实 21.5MB 文件）：`fsprobe={used:410003,bytes:22666447,truncated:true}` 与全文解析**完全一致**，`watermark` 标「来源 transcript」，旧错误归零。
+  - 踩坑：`--session-id` **必须是合法 UUID**（否则静默忽略）；`--plugin-dir` + 已安装版本会**同时加载两份 mod**（验证时须先 `--uninstall` 隔离，否则看到"新旧错误并存"是假象）。
   - 遗留：8MB transcript 上限待调；hadBase 非空拼接（手动 /compact 带参数）未验；auto-compact 的 LLM 摘要路径需 GUI 鉴权会话验；WB_OPS_STATS=1 报表工具仍未验。
