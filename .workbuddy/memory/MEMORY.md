@@ -21,3 +21,10 @@
   - **真机验收**（真实 21.5MB 文件）：`fsprobe={used:410003,bytes:22666447,truncated:true}` 与全文解析**完全一致**，`watermark` 标「来源 transcript」，旧错误归零。
   - 踩坑：`--session-id` **必须是合法 UUID**（否则静默忽略）；`--plugin-dir` + 已安装版本会**同时加载两份 mod**（验证时须先 `--uninstall` 隔离，否则看到"新旧错误并存"是假象）。
   - 遗留：8MB transcript 上限待调；hadBase 非空拼接（手动 /compact 带参数）未验；auto-compact 的 LLM 摘要路径需 GUI 鉴权会话验；WB_OPS_STATS=1 报表工具仍未验。
+- 2026-11-05 v0.13 **token 指标真机验收通过**（commit 9554320，单测 94/94）：标记行内联「≈N tok → ≈M tok（省 P%）」实测生效（如「原文 8.0KB≈2.0k tok → ≈981 tok（省 52%）」）；记账含 `tokBefore/tokAfter`（`kinds` 每类也带）；`node hooks/report.mjs` 首行「省 ≈5.7k tok / 23.7KB (60.7%)」与分类行同口径。
+- 2026-11-05 v0.13.1 **修报表工具在 GUI 会话注册不上**（单测 97/97，宿主 validate ✔）：
+  - **根因（宿主 bundle 反查 + 探针实测，非推断）**：宿主有**两条能力不同的 core**，只有一条允许 mod 注册工具——① 应用级（`hostBindings`→`createModsCommandToolBindings`）`registerTool` 有真实现（`toolManager.register(ModProxyTool)`），走 CLI / `--plugin-dir`；② 会话级（`createFunctionalHookBindings`）`registerTool` 被显式绑成 `throw Error("Session tool registration is not bound")`，**走 GUI 会话**。旧实现只在 `session.start` 注册一次 → GUI 必抛 → 被 mod 自己的 `catch{}` 吞掉 → `mcp__wb_ops__report` 整个会话都不存在。
+  - **探针排除误判**：`$.tool` 命名空间存在（keys: list/register/unregister/call/check/describe）、`register` 返回值形状确为 `{tool:string}`（实测 `{tool:"mcp__wbopsprobe__probereport"}`）——唯一变量是宿主给哪条 core。
+  - **修法**：注册改挂 **session.start + prompt.submit 双入口幂等重试**；`reportToolName` 从**模块级**移进 `register()` 闭包（模块级会让「上个会话已注册」短路掉新会话——宿主每会话重新引导 mod，工具名要每会话重取；单测也因跨 harness 泄漏暴露了这点）。
+  - **新踩坑**：① 宿主不同路径 core 能力不同 → 关键能力挂多入口幂等重试，别只挂一个；② CLI 能注册 ≠ GUI 能注册，探针要覆盖两条路径，否则误判"代码没问题"；③ **每会话状态放 register() 闭包**，别放模块级。
+  - 遗留：GUI 新会话的报表工具真机确认（mod 运行时启动时引导，老会话仍跑旧代码）。

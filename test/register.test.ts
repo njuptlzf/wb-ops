@@ -7,7 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { register, compress, compressList, trimList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, summarizeStats, renderSummary, estTokens, pickWatermark, pickWindow, projectSlug, lastInputTokens, probeTranscript, watermarkLine, guardNote, describeShape, hasLongString, toolNameOf, probeUsage, COMPACT_RETENTION } from '../hooks/register.ts';
 
-function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean; listFail?: boolean; list?: unknown[]; files?: Record<string, string>; usage?: unknown; usageFail?: boolean; cwd?: string } = {}) {
+function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean; listFail?: boolean; list?: unknown[]; files?: Record<string, string>; usage?: unknown; usageFail?: boolean; cwd?: string; registerFail?: boolean } = {}) {
   const writes: { path: string; text: string }[] = [];
   const reads: string[] = [];
   const byTool: Record<string, ($: any, e: any, next: any) => Promise<any>> = {};
@@ -24,7 +24,12 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
   const ENV: Record<string, string | undefined> = { WB_OPS_STATS: '0', ...(opts.env ?? {}) };
   const $ = {
     env: { get: async (k: string) => ENV[k] },
-    tool: { register: async (spec: any) => { regCalls.push(spec); return { tool: 'mcp__wb_ops__report' }; } },
+    tool: { register: async (spec: any) => {
+      regCalls.push(spec);
+      // 模拟宿主会话级 core：registerTool 被绑成 throw（GUI 路径真实行为）
+      if (opts.registerFail) throw new Error('Session tool registration is not bound');
+      return { tool: 'mcp__wb_ops__report' };
+    } },
     fs: {
       write: async (p: string, t: string) => {
         if (opts.writeFail) throw new Error('disk on fire');
@@ -95,7 +100,8 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
   };
   const bash = (result: unknown, event: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) =>
     call('Bash', result, { input: { command: 'npm test' }, ...event }, extra);
-  return { $, writes, reads, call, bash, byTool, regCalls, fireSessionStart, callReport, callUnknown, fnHooks, firePrompt, fireCompact, usageCalls };
+  return { $, writes, reads, call, bash, byTool, regCalls, fireSessionStart, callReport, callUnknown, fnHooks, firePrompt, fireCompact, usageCalls,
+    setEnv: (k: string, v: string | undefined) => { ENV[k] = v; } };
 }
 
 const HOME = { USERPROFILE: 'C:/tmp-home' };
@@ -511,6 +517,36 @@ test('stats 开启：session.start 注册 report 工具', async () => {
   assert.equal(h.regCalls[0].inputSchema.type, 'object');
 });
 
+test('v0.13.1 注册失败不炸主链路：session.start 抛错时 prompt.submit 应重试', async () => {
+  // 回归用例：宿主 GUI 会话走会话级 core，registerTool 被绑成 throw（"Session tool registration is not bound"）。
+  // 修复前：注册只在 session.start 试一次 → 抛错被吞 → 报表工具整个会话都不存在。
+  // 修复后：prompt.submit 是第二个注册入口 → 重试成功；且两次都不抛、不影响主链路。
+  const h = harness({ env: { ...HOME, WB_OPS_STATS: '1' }, registerFail: true });
+
+  const s1 = await h.fireSessionStart();                       // 抛错被 mod 吞掉，但必须透传 next
+  assert.deepEqual(s1, { passed: {} }, '注册失败也必须透传 next（fail-open）');
+  assert.equal(h.regCalls.length, 1, 'session.start 确实尝试过注册');
+
+  const p1 = await h.firePrompt();                             // 第二个入口：再试一次（仍失败但不能炸）
+  assert.ok(p1, 'prompt.submit 必须正常返回');
+  assert.equal(h.regCalls.length, 2, 'prompt.submit 应重试注册一次');
+});
+
+test('v0.13.1 注册幂等：session.start 成功后 prompt.submit 不重复注册', async () => {
+  const h = harness({ env: { ...HOME, WB_OPS_STATS: '1' } });
+  await h.fireSessionStart();
+  assert.equal(h.regCalls.length, 1);
+  await h.firePrompt();
+  assert.equal(h.regCalls.length, 1, '已注册则不再重复注册（省一次 host 调用）');
+});
+
+test('v0.13.1 stats 关闭：不发起任何注册调用', async () => {
+  const h = harness({ env: { ...HOME, WB_OPS_STATS: '0' } });
+  await h.fireSessionStart();
+  await h.firePrompt();
+  assert.equal(h.regCalls.length, 0, '记账关闭时不注册（不往提示词塞 schema）');
+});
+
 test('report 工具：读目录聚合渲染（谓词命中、next 不可达）', async () => {
   const dir = 'C:/tmp-home/.workbuddy/wb-ops/stats';
   const h = harness({
@@ -534,9 +570,11 @@ test('report 工具：fs.list 抛错 → 空账本文案（fail-open）', async 
 });
 
 test('report 工具：stats 未开 → 提示文案', async () => {
-  const reg = harness({ env: { ...HOME, WB_OPS_STATS: '1' } });
-  await reg.fireSessionStart(); // 本会话注册过（设置 reportToolName），随后 stats 关掉 → 防御分支
-  const h = harness({ env: HOME });
+  // 注意：reportToolName 现在是 **register() 闭包内**的状态（每会话独立），
+  // 因此必须在**同一个 harness** 里先注册、再关掉 stats，才能命中自家 handler。
+  const h = harness({ env: { ...HOME, WB_OPS_STATS: '1' } });
+  await h.fireSessionStart();          // 本会话注册过（设置 reportToolName）
+  h.setEnv('WB_OPS_STATS', '0');       // 随后 stats 关掉 → 防御分支
   const { out } = await h.callReport();
   assert.match(out.result, /报表未启用/);
 });

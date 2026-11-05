@@ -2,7 +2,7 @@
 
 WorkBuddy 的**上下文治理 Mod**（Mod-first）：进程内 `tool.call` 中间件，在工具结果进入模型上下文之前做确定性压缩，原文落盘可回查。错误输出**永不压缩**。目标只有一个：**降本增效——让进入上下文的每一份 token 都携带高价值信息**。
 
-当前版本 v0.13 覆盖 **8 个高频出口 + 通配兜底**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（宿主原生字符串数组 + JSON 数组文本两种形态）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）；开启记账后提供省量报表（会话内 `mcp__wb_ops__report` 工具 + 沙箱外 `node hooks/report.mjs`，按工具类型细分 分类 行；**v0.13 起默认开**，每次压缩的标记行还内联 `≈N tok → ≈M tok（省 P%）`）；上下文水位守卫（prompt.submit ≥85% 一行提醒）与压缩保留指示（session.compact instructions，Mod 版 PreCompact）；POLICY 之外的所有工具名（MCP、宿主新增）由谓词 matcher 兜底走通用压缩。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
+当前版本 v0.13.1 覆盖 **8 个高频出口 + 通配兜底**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（宿主原生字符串数组 + JSON 数组文本两种形态）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）；开启记账后提供省量报表（会话内 `mcp__wb_ops__report` 工具 + 沙箱外 `node hooks/report.mjs`，按工具类型细分 分类 行；**v0.13 起默认开**，每次压缩的标记行还内联 `≈N tok → ≈M tok（省 P%）`）；上下文水位守卫（prompt.submit ≥85% 一行提醒）与压缩保留指示（session.compact instructions，Mod 版 PreCompact）；POLICY 之外的所有工具名（MCP、宿主新增）由谓词 matcher 兜底走通用压缩。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
 
 | 工具 | 策略 |
 |---|---|
@@ -274,6 +274,37 @@ bash test/run-acceptance.sh <合法UUID> "验收" WB_OPS_GUARD_PCT=10   # 真机
 
 ---
 
+## v0.13.1 变更（2026-11-05）—— 修报表工具在 GUI 会话注册不上
+
+**根因（宿主 bundle 反查 + 探针实测，非推断）**：宿主有**两条能力不同的 core**，只有一条允许 mod 注册工具。
+
+| core | 来源 | `$.tool.register` 行为 | 走这条的运行时 |
+|---|---|---|---|
+| 应用级 | `hostBindings` → `createModsCommandToolBindings` | **有真实现** → `toolManager.register(ModProxyTool)`，真注册 | CLI / `--plugin-dir` |
+| 会话级 | `createFunctionalHookBindings` | 被显式绑成 `throw Error("Session tool registration is not bound")` → **必抛错** | GUI 会话 |
+
+旧实现只在 `session.start` 注册一次，而 GUI 会话拿到的正是**会话级 core** → 注册必抛 → 被 mod 自己的 `catch {}` 吞掉 → **`mcp__wb_ops__report` 整个会话都不存在**（fail-open 的典型表现：主链路无损，但功能静默缺失）。
+
+探针实测（`--plugin-dir` 加载临时 mod，`session.start` 里调 `$.tool.register`）：
+
+```jsonc
+// 落盘 ~/.workbuddy/wb-ops/probe2-session-start.json（CLI 路径 = 应用级 core）
+{ "hasToolNs": true, "toolKeys": ["list","register","unregister","call","check","describe"],
+  "registerResult": { "tool": "mcp__wbopsprobe__probereport" } }   // 返回值形状 = {tool:string}，与代码解析一致
+```
+
+**修复**：
+
+| 改动 | 说明 |
+|---|---|
+| 双入口幂等重试 | 注册改挂在 `session.start` **与** `prompt.submit` 两个入口；任一拿到可用 core 即注册成功，已注册则 O(1) 跳过 |
+| 状态收敛到闭包 | `reportToolName` 从**模块级**移进 `register()` 闭包——模块级会让「上一个会话已注册」短路掉新会话的注册（宿主每会话重新引导 mod，工具名要每会话重取） |
+| 不影响主链路 | 注册失败仍 fail-open（吞异常，主链路压缩/落盘/水位完全不依赖报表工具） |
+
+单测 **97/97 全绿**（新增 3 条：注册失败不炸主链路 + prompt.submit 重试、注册幂等、stats 关闭时零注册调用）。
+
+---
+
 ## v0.13 变更（2026-11-05）—— token 指标：省了多少，一眼可见
 
 **目标**：把"省了多少"从字节换算成人人认得的 token，并让它出现在 wb 对话里，而不是要求用户先配环境变量再翻文件。
@@ -287,3 +318,5 @@ bash test/run-acceptance.sh <合法UUID> "验收" WB_OPS_GUARD_PCT=10   # 真机
 | 默认开 | `WB_OPS_STATS` 默认开，`0/off/false/no` 关；关掉后标记行 token 照旧，只少累计报表 |
 
 **未做**：WorkBuddy GUI 没有插件可用的 statusline（`statusLine` 只在 CLI TUI 的 settings.json 生效），故不做常驻栏——标记行 + 报表工具已覆盖"看得到"。
+
+**v0.13.1 补**：v0.13 发布时报表工具在 GUI 会话其实注册不上（根因见下节），v0.13.1 已修。

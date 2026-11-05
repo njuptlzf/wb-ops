@@ -917,9 +917,37 @@ function makeHandler(kind: string) {
   };
 }
 
-let reportToolName: string | null = null; // $.tool.register 返回值，形如 mcp__wb_ops__report
-
+/**
+ * 报表工具注册：宿主有**两条能力不同的 core**（2026-11-05 实测 bundle 结论）——
+ *   ① 应用级 core（`hostBindings` → `createModsCommandToolBindings`）：`registerTool` 有真实现
+ *      → `toolManager.register(ModProxyTool)`，真注册成功（CLI 路径走这条，探针实测 `registerResult={tool:"mcp__wbopsprobe__probereport"}`）。
+ *   ② 会话级 core（`createFunctionalHookBindings`）：`registerTool` 被宿主显式绑成
+ *      `throw Error("Session tool registration is not bound")` → 必抛错（GUI 路径走这条）。
+ * 结论：**`session.start` 这一个时机不够**——GUI 会话拿到的 core 不支持注册工具。
+ * 修法：把注册做成「幂等 + 多入口重试」，凡拿到任何可用 core 的时机都试一次；
+ * 失败不抛（fail-open），下次入口再试。
+ *
+ * 状态放在 register() 的闭包里（**不是模块级**）：模块级会让「上一个会话已注册」直接短路掉
+ * 新会话的注册——宿主每会话重新引导 mod，工具名要每会话重新拿一次。
+ */
 export function register(on: On, _options?: unknown): void {
+  let reportToolName: string | null = null; // $.tool.register 返回值，形如 mcp__wb_ops__report
+
+  const tryRegisterReportTool = async ($: any): Promise<void> => {
+    if (reportToolName) return;                     // 已注册 → 幂等，不重复
+    try {
+      const cfg = await readCfg($);
+      if (!cfg.enabled || !cfg.stats) return;       // 关了就不注册（token 经济自洽）
+      if (!($ && $.tool && typeof $.tool.register === 'function')) return;
+      const r = await $.tool.register({
+        name: 'report',
+        description: 'wb-ops 节省报表：各会话压缩次数、原文/压缩后字节、节省比例',
+        inputSchema: { type: 'object', properties: {} },
+      });
+      if (r && typeof r.tool === 'string') reportToolName = r.tool;
+    } catch { /* 本次 core 不支持注册（如 GUI 会话级 core）→ 换入口再试 */ }
+  };
+
   for (const tool of Object.keys(POLICY)) {
     on('tool.call', { tool }, makeHandler(POLICY[tool]));
   }
@@ -929,20 +957,11 @@ export function register(on: On, _options?: unknown): void {
   on('tool.call', { tool: (v: unknown) => typeof v === 'string' && !KNOWN_TOOLS.has(v) && v !== reportToolName }, makeHandler('other'));
 
   // #3 报表：仅当用户开了 WB_OPS_STATS 才注册工具——不记账时不往提示词里塞 schema（token 经济自洽）
+  // 注册挂在**两个**入口：session.start（应用级 core 有真绑定时命中）与 prompt.submit
+  // （GUI 会话走宿主会话级 core，session.start 那次注册必抛错，prompt.submit 是第二个机会）。
+  // 两者都失败也无所谓——报表是增强项，主链路（压缩/落盘/水位）完全不依赖它。
   on('session.start', async ($: any, e: any, next: any) => {
-    try {
-      if (!reportToolName) {
-        const cfg = await readCfg($);
-        if (cfg.enabled && cfg.stats) {
-          const r = await $.tool.register({
-            name: 'report',
-            description: 'wb-ops 节省报表：各会话压缩次数、原文/压缩后字节、节省比例',
-            inputSchema: { type: 'object', properties: {} },
-          });
-          if (r && typeof r.tool === 'string') reportToolName = r.tool;
-        }
-      }
-    } catch { /* 注册失败只影响报表，不影响主链路 */ }
+    await tryRegisterReportTool($);
     return next(e);
   });
 
@@ -961,6 +980,9 @@ export function register(on: On, _options?: unknown): void {
   // 越线才改写：契约 {text, context:string[]}，context 数组随 prompt 进模型（bundle @2099903 合并逻辑）
   on('prompt.submit', async ($: any, e: any, next: any) => {
     try {
+      // 报表工具注册的**第二个入口**：GUI 会话级 core 不支持注册工具（宿主把 registerTool 绑成 throw），
+      // session.start 那次会失败；这里每轮再试一次（幂等，已注册则 O(1) 返回）。
+      await tryRegisterReportTool($);
       const cfg = await readCfg($);
       if (cfg.enabled && cfg.guard) {
         // 一次读取两用：① 探测真实形状（写 debug，只记结构/数值）② 喂水位守卫
