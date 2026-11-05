@@ -38,6 +38,12 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
         const hit = writes.find((w) => w.path === p);
         return hit ? hit.text : undefined;
       },
+      stat: async (p: string) => {
+        if (opts.readFail) throw new Error('no such file');
+        const t = opts.files?.[p];
+        if (t === undefined) throw new Error('no such file');
+        return { kind: 'file', size: Buffer.byteLength(t, 'utf8'), mtimeMs: 0, isLink: false };
+      },
     },
     session: {
       id: async () => 'deadbeef-0000-1111',
@@ -926,6 +932,39 @@ test('v0.12 读权限探测：沙箱拒绝读 → 有 err 不抛；projects 目�
   const p2 = await probeTranscript(h2.$, 'C:/tmp-home', SID, 'C:\\Users\\dev\\work\\wb-ops', 'C:/custom');
   assert.equal(p2.used, 50000);
   assert.equal(p2.path, p3);
+});
+
+// v0.12.1：宿主 transcript 只增不减，长会话实测 20MB+（见 MEMORY「遗留」）。
+// 旧实现对 >8MB 直接判 'transcript too big' → 长会话 fallback 永久失效，
+// 而 usage 恰好在 pre-message-auto compact 后会短暂归零 → 那个窗口正好撞上体积上限。
+// 新行为：仍读全文，但只解析尾部；truncated 标记进 debug。
+test('v0.12.1 超大 transcript：不再整体拒绝，尾部采样仍能取到水位', async () => {
+  // 造一个 >8MB 的 transcript：前面 9MB 噪音，末尾是带 inputTokens 的行
+  const noise = 'x'.repeat(9_000_000);
+  const big = `${noise}\n${JSON.stringify({ providerData: { usage: { inputTokens: 410003 } } })}\n`;
+  assert.ok(Buffer.byteLength(big, 'utf8') > 8_000_000, '样本确实超 8MB');
+  const h = harness({ env: HOME, files: { [TX_PATH]: big } });
+  const p = await probeTranscript(h.$, 'C:/tmp-home', SID, 'C:\\Users\\dev\\work\\wb-ops');
+  assert.equal(p.used, 410003, '超大文件仍能提取水位');
+  assert.equal(p.truncated, true, '标记为已截断');
+  assert.equal(p.err, undefined, '不再因为体积整条链路失守');
+  assert.ok((p.bytes ?? 0) > 8_000_000, '字节数取自 fs.stat');
+});
+
+test('v0.12.1 正常体积 transcript：truncated=false，不受影响', async () => {
+  const h = harness({ env: HOME, files: { [TX_PATH]: transcript() } });
+  const p = await probeTranscript(h.$, 'C:/tmp-home', SID, 'C:\\Users\\dev\\work\\wb-ops');
+  assert.equal(p.used, 71198);
+  assert.equal(p.truncated, false);
+});
+
+test('v0.12.1 lastInputTokens 支持分段起点：from 之前的行不参与扫描', () => {
+  const txt = `${JSON.stringify({ providerData: { usage: { inputTokens: 111 } } })}\n${JSON.stringify({ providerData: { usage: { inputTokens: 222 } } })}\n`;
+  assert.equal(lastInputTokens(txt), 222, '默认取最后一条');
+  const from = txt.indexOf('\n') + 1;
+  assert.equal(lastInputTokens(txt, from), 222, 'from 落在两条中间时仍取最后一条');
+  const from2 = txt.length;   // 分段起点在文末 → 无可扫行
+  assert.equal(lastInputTokens(txt, from2), undefined, '分段内没有完整行时判不出');
 });
 
 test('v0.12 水位守卫：宿主 usage 恒 0 → transcript fallback 点亮提醒与余量文件', async () => {

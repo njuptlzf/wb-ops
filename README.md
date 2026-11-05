@@ -33,7 +33,8 @@ WorkBuddy 的**上下文治理 Mod**（Mod-first）：进程内 `tool.call` 中�
 实测根因：其 UserPromptSubmit 每个回合同步起 Git Bash（本机实测 2.1–2.6s）+ node 冷启动 + 扫最大 16MB transcript，并发时必击穿 5s 预算。本项目对策：
 
 1. **零子进程**——只注册 Mod，`hooks.json` 里没有任何 `command` hook（只有一个 `modules` 数组）。
-2. **不做全量 transcript 扫描**——水位守卫只在 `prompt.submit`（每轮用户提交一次，不在 tool.call 热路径）读 `$.session.usage()`（O(1)）；宿主 binding 恒 0 时 v0.12 才追加一次**有界尾部采样**：整读有 8MB 封顶、只逆扫最后 ≤40 行 JSONL、命中路径缓存、连续 3 次读失败即放弃，且可用 `WB_OPS_GUARD_FS=0` 一键关掉。与事故里「每回合扫 16MB + 起进程」不是一个量级。
+2. **不做全量 transcript 扫描**——水位守卫只在 `prompt.submit`（每轮用户提交一次，不在 tool.call 热路径）读 `$.session.usage()`（O(1)）；宿主 binding 短暂归零时 v0.12 才追加一次**有界尾部采样**：只逆扫最后 ≤40 行 JSONL、命中路径缓存、连续 3 次读失败即放弃，且可用 `WB_OPS_GUARD_FS=0` 一键关掉。与事故里「每回合扫 16MB + 起进程」不是一个量级。
+   - **v0.12.1 超大文件降级**：宿主 transcript 只增不减（实测长会话可达 20MB+），且 `usage` 恰好在 `pre-message-auto` compact 后约 8 秒内归零——这两个条件会同时撞上。旧实现对 >8MB 直接判 `transcript too big` → 该窗口内 fallback 永久失守。现改为：仍整读（实测 22MB ≈115ms，内存代价可控），但**只解析尾部 ≤4M 字符**、并用 `fs.stat` 预判体积、在 debug 里标 `truncated`——**不再因为体积而整条链路失守**。
 3. **软超时自弃**——压缩自带 100ms 预算（可调），超时放弃、透传原文。
 4. **fail-open**——未知结果形状、任何异常、`isError`、非零退出码：一律原样返回。插件坏掉的最坏情况 = 当它不存在。
 5. **无共享可变状态文件**——spill 路径 `spill/<session前8位>/<序号>-<callId>.txt`，并发不互踩（50 路并发有单测）。
@@ -118,14 +119,15 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" pl
 |---|---|---|
 | `~/.workbuddy/wb-ops/debug/shape-<sid8>.json` | 工具名 + result 的键名/类型/长度（**无正文**） | 判不出文本形状**且**内容超预算时，每会话最多 20 条 |
 | `~/.workbuddy/wb-ops/debug/usage-<sid8>.json` | `$.session.usage()` 的返回形状（键名/类型/数值）+ deny 文案 | 形状**变化**时（形状不变不重复写，避免每轮落盘） |
-| `~/.workbuddy/wb-ops/debug/fsprobe-<sid8>.json` | **v0.12** transcript 沙箱读权限探测：`ok/err/path/bytes`（路径是目录名，无正文） | 结论**变化**时（首次 fallback、读权限变化、transcript 出现） |
+| `~/.workbuddy/wb-ops/debug/fsprobe-<sid8>.json` | **v0.12** transcript 沙箱读权限探测：`ok/err/path/bytes/truncated`（路径是目录名，无正文） | 结论**变化**时（首次 fallback、读权限变化、transcript 出现、体积跨过 8MB 门槛） |
+| `~/.workbuddy/wb-ops/debug/compact-<sid8>.json` | **v0.12** `session.compact` 事件：`trigger/hadBase/baseLen/mergedLen/hasRetention`（**不记正文**） | 每次 compact 事件（用于验证压缩保留指示真的合并进 instructions） |
 
 隐私纪律：字符串一律只记长度，正文永不落盘。宿主升级后若某通道突然不生效，先看这三个文件。
 
 ## 开发 / 测试
 
 ```bash
-node --test test/register.test.ts   # 88 项，全绿（需 Node ≥22.6 的 --experimental-strip-types，或 Node 23+ 直接跑）
+node --test test/register.test.ts   # 91 项，全绿（需 Node ≥22.6 的 --experimental-strip-types，或 Node 23+ 直接跑）
 ```
 
 沙箱纪律：mods 内禁止 `node:require/process/global`（引擎会当场拒绝整个 mod），`register.ts` 唯一的 import 是 `codebuddy-code` 的**纯类型**导入，运行时被擦除。所有宿主能力走 `$`：`$.env` / `$.fs.write` / `$.session.id()`。
@@ -150,7 +152,7 @@ node --test test/register.test.ts   # 88 项，全绿（需 Node ≥22.6 的 --e
 ## 已验证 / 未验证
 
 - ✅ **③ 通配兜底的谓词 matcher（2026-11-05 真机闭环）**：`domain_search` 输出 52.1KB → 兜底压缩生效（头部 + `命中关键行` + 尾部，`[+NNNNB]` 单行截断正常）。函数谓词每次事件重评、路由真实生效。
-- ✅ mods 加载（CLI 启动日志 `hooks: tool.call session.start prompt.submit session.compact` 四通道全注册）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复）、报表聚合与渲染（谓词 matcher、坏文件跳过、list 抛错兜底、CLI 真目录聚合）、水位守卫与压缩保留指示（形状候选/阈值边界/关闭零触碰/fail-open）、③ 通配兜底（预算内零影响/非零透传/可关/谓词互斥）、① by-kind 分类账本（kinds 写入/聚合/渲染、无 kinds 老账本兼容）、② 水位数值文件（每轮小写/越线附带 Read 路径/写失败静默/stats-off 仍跟 guard）、④ GUI 安装助手（临时 HOME 装+卸、known/installed 形状、既有市场保留、cache payload 落地）、v0.11 形状诊断通道（只记结构/只记长度/限频/小输出不打扰）、v0.12 水位数据源（嵌套 context 候选/tokens=0 静默/transcript 尾部逆扫/权限探测/目录兜底/可关）——离线 mock API 单测 **88 项全绿**
+- ✅ mods 加载（CLI 启动日志 `hooks: tool.call session.start prompt.submit session.compact` 四通道全注册）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复）、报表聚合与渲染（谓词 matcher、坏文件跳过、list 抛错兜底、CLI 真目录聚合）、水位守卫与压缩保留指示（形状候选/阈值边界/关闭零触碰/fail-open）、③ 通配兜底（预算内零影响/非零透传/可关/谓词互斥）、① by-kind 分类账本（kinds 写入/聚合/渲染、无 kinds 老账本兼容）、② 水位数值文件（每轮小写/越线附带 Read 路径/写失败静默/stats-off 仍跟 guard）、④ GUI 安装助手（临时 HOME 装+卸、known/installed 形状、既有市场保留、cache payload 落地）、v0.11 形状诊断通道（只记结构/只记长度/限频/小输出不打扰）、v0.12 水位数据源（嵌套 context 候选/tokens=0 静默/transcript 尾部逆扫/权限探测/目录兜底/可关）——离线 mock API 单测 **91 项全绿**
 - ✅ Grep/Glob 输出形状：从 86 条真实 transcript 确认 = JSON 字符串数组；**2026-11-05 真机再测发现宿主原生形态是 `content: string[]`**（不是 JSON 文本）→ v0.11 已适配（单测钉死：裁条目+单行说明、保持数组形态、预算内零影响、混合类型仍 fail-open）
 - ✅ **真机压缩闭环（2026-11-05 GUI 会话，pid 72880）**：Bash 13.2KB / PowerShell 14.9KB / TaskOutput 30.4KB / Read .log 24.5KB（含 `回看: Read offset=34 limit=180` 空洞指路）/ MCP 兜底 52.1KB / 错误现场 Exit Code 2 完整透传 + `[wb-ops 提示]` 一行 / 预算内零影响 / Read .ts 682 行原样不裁——5 次 spill 落盘 135KB
 - ⚠️ **报表工具注册两处宿主未文档化点**：`$.tool.register` 返回值取 `.tool` 全名（bundle 源码如此，若返形状不符则报表工具不出现，主链路无损）；`$.fs.list` 条目形状未文档化（string/{name} 双兼容 + 抛错即空账本）。开 `WB_OPS_STATS=1` 后新开会话看工具列表里有无 `mcp__wb_ops__report`。
@@ -158,7 +160,8 @@ node --test test/register.test.ts   # 88 项，全绿（需 Node ≥22.6 的 --e
   v0.12 对策：`pickWatermark` 认嵌套 `context.tokens/window`（宿主修好后自动点亮，`tokens=0` 仍静默）；否则走 transcript 尾部采样取 used、window 仍用 `usage().context.window`；读权限探测落 `debug/fsprobe-<sid8>.json`。**待真机确认**：mod 沙箱 `$.fs` 能否读 `<HOME>/.workbuddy/projects/`（若被拒，看 fsprobe 的 err，守卫继续保持静默）。
 - ⚠️ **宿主 `persisted-output` 阈值 ≈8KB 是硬天花板**：超过它宿主先落盘，mod 看不到原文（README 明确"宿主落的 persisted-output 不碰"）。所以 mod 的实际收益上限 = (预算, 8KB) 区间 + 宿主未落盘的其余工具。v0.11 预算降到 4500 正是为了把这块区间吃满。
 - ⚠️ **`tool.call` 事件里 `e.input` 的确切字段名**（代码候选 `input/tool_input/arguments` + `file_path/path/filePath`，判不出即透传，不会误伤）——Read 分档已真机验证（.log 走数据档、.ts 走源码档）；其余工具的 input 字段名仍未逐个核对。
-- ⚠️ **`prompt.submit` 返回 `{text,context}` 的宿主合并行为**——需一次真实越线（v0.12 可用 `WB_OPS_GUARD_PCT=10` 降低门槛）看是否出现 `[wb-ops 水位]` 行；`session.compact` instructions 合并同理需一次真实 auto-compact 验证。
+- ⚠️ **`prompt.submit` 返回 `{text,context}` 的宿主合并行为**——✅ **v0.12.1 已真机验证**：`[wb-ops 水位] 上下文约 100%（300000/300000 tok）… 余量速查：Read …/watermark/wbo0guar.num` 真实注入（宿主包成 `<system-reminder>` 进 input），`session.compact` instructions 合并也已真机验证（`debug/compact-<sid8>.json` 记 `trigger:"auto"` / `mergedLen:73` / `hasRetention:true`，真 auto-compact 的 `compactType=pre-message-auto` / `compactionTrigger=pre_message_threshold`）。
+- ✅ **v0.12.1 大文件降级已真机验证**：用真实 21.5MB 会话文件跑 mod → `fsprobe` 得 `{"used":410003,"bytes":22666447,"truncated":true}`、`watermark` 标「来源 transcript」，与全文解析**完全一致**；旧错误 `transcript too big` 归零。实测 22MB 全量读 ≈115ms、内存 134MB，只在 `prompt.submit` 每轮一次。
 - ⚠️ GUI 注册表写入格式对照本机宿主自写文件（sana `local@` 记录）复刻，install-gui.mjs 有离线装/卸单测，但 **GUI 重启后的插件列表识别与启用点击**未验证（真机已确认 mod 会加载，即注册表三件套有效）。
 
 ## 2026-11-05 真机安装闭环（官方《插件市场》文档校对）
@@ -188,11 +191,29 @@ node --test test/register.test.ts   # 88 项，全绿（需 Node ≥22.6 的 --e
 |---|---|
 | `pickWatermark` 嵌套候选 | 认 `context.tokens` / `context.window`（宿主真实形状）；`used<=0` 视为无数据，绝不拿 0 假报水位 |
 | `pickWindow` | 即使 tokens 缺失也能取真算的 `context.window` 作分母 |
-| `probeTranscript` | 读 `<HOME>/.workbuddy/projects/<cwd-slug>/<sid>.jsonl`，只逆扫最后 ≤40 行取最后一条 `providerData.usage.inputTokens`（已含 cache_read，不重复叠加）；整读 8MB 封顶、命中路径缓存、slug 猜不中列目录兜底、连续 3 次失败即放弃 |
-| 沙箱读权限探测 | 结论写 `debug/fsprobe-<sid8>.json`（只记 ok/err/path/bytes，**无正文**）；签名不变不重复落盘 |
+| `probeTranscript` | 读 `<HOME>/.workbuddy/projects/<cwd-slug>/<sid>.jsonl`，只逆扫最后 ≤40 行取最后一条 `providerData.usage.inputTokens`（已含 cache_read，不重复叠加）；**v0.12.1：>8MB 不再整体拒绝**——整读后只解析尾部 ≤4M 字符（`fs.stat` 预判体积，debug 标 `truncated`）；命中路径缓存、slug 猜不中列目录兜底、连续 3 次失败即放弃 |
+| 沙箱读权限探测 | 结论写 `debug/fsprobe-<sid8>.json`（只记 ok/err/path/bytes/truncated，**无正文**）；签名不变不重复落盘 |
 | 数据源标注 | `watermark/<sid8>.num` 第二行标 `来源 transcript`；宿主修好 binding 后自动回到 `usage` 直出 |
 | 新开关 | `WB_OPS_GUARD_FS=0` 关闭 fallback；`WB_OPS_PROJECTS=<dir>` 覆盖 transcript 目录 |
 
 **性能边界**：只在 `prompt.submit`（每轮用户提交一次）触发，不在 `tool.call` 热路径；零子进程；任何异常 fail-open 静默。与 sana 事故（每回合起 Bash + 扫 16MB）不在一个量级。
 
 **待真机验证**：mod 沙箱 `$.fs` 对 `projects/` 目录的读权限（看 `fsprobe` 的 `err`）、≥阈值时的 `[wb-ops 水位]` 行、以及 `session.compact` 的 instructions 合并。
+
+---
+
+## v0.12.1 变更（2026-11-05）—— 大文件降级 + compact 诊断
+
+**目标**：修掉长会话里水位守卫「双源同失」的窗口，并让压缩保留指示可验证。
+
+| 改动 | 说明 |
+|---|---|
+| **超大 transcript 不再整体拒绝** | 宿主 transcript 只增不减（实测真实会话 21.5MB）。旧实现对 >8MB 判 `transcript too big` → fallback 永久失守。现改为整读后**只解析尾部 ≤4M 字符**，`fs.stat` 预判体积并在 debug 标 `truncated` |
+| `lastInputTokens(txt, from)` | 支持分段起点：只解析尾部窗口，尾部首行可能是半行（丢弃不影响结论） |
+| `session.compact` 诊断 | 每次 compact 事件写 `debug/compact-<sid8>.json`：`trigger/hadBase/baseLen/mergedLen/hasRetention`（**不记正文**） |
+
+**为什么必须修（真机证据）**：`usage` 归零的精确时刻 = **pre-message-auto compact 之后**（实测 compact 摘要落盘 → 8.2 秒后 usage 才恢复）。而 transcript 涨到 8MB 需要长时间积累——两个条件在长会话里会同时撞上，此时旧实现会出现「usage 归零 + transcript 超限」→ **水位提醒彻底静默**。
+
+**实测代价可接受**：22MB 全量 `readFile` + `toString` + `split` 共 **115ms**、常驻内存 134MB，且只在 `prompt.submit` 每轮一次。
+
+**真机验收**：用真实 21.5MB 会话文件跑 mod → `fsprobe` 得 `{"used":410003,"bytes":22666447,"truncated":true}`、`watermark` 标「来源 transcript」，与全文解析结果**完全一致**；旧错误 `transcript too big` 归零。
