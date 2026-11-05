@@ -150,6 +150,17 @@ token 数是**估算**，公式与宿主 `TokenUtils.estimateTokensRough` 逐字
 
 记账 **v0.13 起默认开**（`WB_OPS_STATS=0/off/false/no` 关）：每次压缩多一对小 JSON 读写（约 1KB）；会话启动多起一个报表 MCP 进程（v0.14 起，`node mcp/server.mjs`，闲置时只占管道不占 CPU），工具 schema 约百余 token。嫌贵就设 `WB_OPS_STATS=0`——标记行里的内联 token 数字不受影响，仍随时可见；MCP 进程与工具是否随该变量消失未做联动（工具在、数据为空时会如实回「还没有记账数据」）。
 
+### Web 看板：怎么启动、数据怎么更新（v0.15）
+
+两条启动路，都在**仓库根目录**跑，零依赖（只要 node）：
+
+| 模式 | 命令 | 行为 |
+|---|---|---|
+| 快照 | `node scripts/dashboard.mjs` | 生成 `~/.workbuddy/wb-ops/dashboard.html` 并打印路径（`--out <路径>` 换位置；`--open` 顺带用默认浏览器打开）。数据是**生成一刻**的账本，想看最新就重跑 |
+| 常驻服务 | `node scripts/dashboard.mjs --serve [端口]` | 默认 8765，浏览器开 `http://127.0.0.1:8765`。**每次刷新重读账本**，wb 会话里刚压完，刷新页面就涨上去；`Ctrl+C` 停 |
+
+数据更新机制：看板**不连任何服务、不写数据库**，只读 `~/.workbuddy/wb-ops/stats/<sid8>.json`。记账开着时（v0.13 起默认开），wb 进程内的 mod 在**每次成功压缩后**整读整写那个小文件——读现值，累加本次 `before/after/tokBefore/tokAfter` 和按工具类型的 `kinds`，写回。所以账本是"边压边写"的，看板与账本之间没有任何缓存：快照模式生成时读一次，serve 模式每个请求读一次。`WB_OPS_STATS=0` 关掉后账本停止更新，看板显示的就是停更前的数据（历史会话的条目照常在）。
+
 ## 配置（环境变量，经 `$.env.get` 读取）
 
 | 变量 | 默认 | 说明 |
