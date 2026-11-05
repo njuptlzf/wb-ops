@@ -577,49 +577,9 @@ async function recordStats($: any, home: string, sid: string, tool: string, befo
   } catch { /* 记账失败不影响主流程 */ }
 }
 
-// ------------------------------------------------------------------ report (#3)
-
-export interface StatKind { calls: number; before: number; after: number; tokBefore?: number; tokAfter?: number }
-export interface StatRow { file: string; calls: number; before: number; after: number; tokBefore?: number; tokAfter?: number; tool?: string; ts?: string; kinds?: Record<string, StatKind> }
-export interface StatAgg { calls: number; before: number; after: number; tokBefore: number; tokAfter: number; kinds: Record<string, StatKind> }
-
-export function summarizeStats(rows: StatRow[]): StatAgg {
-  let calls = 0, before = 0, after = 0, tokBefore = 0, tokAfter = 0;
-  const kinds: Record<string, StatKind> = {};
-  for (const r of rows) {
-    calls += r.calls || 0; before += r.before || 0; after += r.after || 0;
-    tokBefore += r.tokBefore || 0; tokAfter += r.tokAfter || 0;
-    for (const [k, v] of Object.entries(r.kinds || {})) {
-      const t = kinds[k] = kinds[k] || { calls: 0, before: 0, after: 0, tokBefore: 0, tokAfter: 0 };
-      t.calls += v.calls || 0; t.before += v.before || 0; t.after += v.after || 0;
-      t.tokBefore = (t.tokBefore || 0) + (v.tokBefore || 0);
-      t.tokAfter = (t.tokAfter || 0) + (v.tokAfter || 0);
-    }
-  }
-  return { calls, before, after, tokBefore, tokAfter, kinds };
-}
-
-export function renderSummary(rows: StatRow[]): string {
-  const agg = summarizeStats(rows);
-  if (!agg.calls) return '[wb-ops] 还没有记账数据（需要 WB_OPS_STATS=1 且发生过压缩）';
-  const saved = agg.before - agg.after;
-  const pct = agg.before ? ((saved / agg.before) * 100).toFixed(1) : '0.0';
-  const kb = fmtBytes;
-  const kindList = Object.entries(agg.kinds).sort((a, b) => b[1].before - a[1].before);
-  const kindFmt = ([k, v]: [string, StatKind]) => v.tokBefore
-    ? `${k} ${v.calls}次 ≈${fmtTok(v.tokBefore)}→${fmtTok(v.tokAfter || 0)} tok`
-    : `${k} ${v.calls}次 ${kb(v.before)}→${kb(v.after)}`;
-  const lines = [
-    agg.tokBefore > 0
-      ? `[wb-ops 报表] 压缩 ${agg.calls} 次 · 省 ≈${fmtTok(agg.tokBefore - agg.tokAfter)} tok / ${kb(saved)} (${pct}%) · 原文 ${kb(agg.before)}≈${fmtTok(agg.tokBefore)} tok → 压缩后 ${kb(agg.after)}≈${fmtTok(agg.tokAfter)} tok · 记账会话 ${rows.length} 个`
-      : `[wb-ops 报表] 压缩 ${agg.calls} 次 · 原文 ${kb(agg.before)} → 压缩后 ${kb(agg.after)} · 省 ${kb(saved)} (${pct}%) · 记账会话 ${rows.length} 个`,
-    ...(kindList.length ? ['  分类：' + kindList.map(kindFmt).join(' · ')] : []),
-    ...rows.sort((a, b) => (b.ts || '').localeCompare(a.ts || '')).slice(0, 12)
-      .map(r => `  ${r.file.replace(/\.json$/, '')}  ${r.calls} 次  ${kb(r.before)}→${kb(r.after)}  最后: ${r.tool || '?'} ${r.ts ? r.ts.slice(0, 10) : ''}`),
-    '  口径：token 为估算（与宿主同公式 ceil(中文/1.8)+ceil(其余/4)）；只计本 Mod 实际改写的输出，被裁原文在 ~/.workbuddy/wb-ops/spill/ 可回查。',
-  ];
-  return lines.join('\n');
-}
+// 报表渲染（#3）v0.14 起移出本文件：见 lib/report-core.mjs。
+// 原因见 register() 顶部「报表工具」注释——工具注册不再由 mod 承担，渲染也就没有理由
+// 在 mod 沙箱里留第二份实现（两份实现必然漂口径）。本文件只负责**产生**记账数据。
 
 // ---------------------------------------------------------------- guard (#4/#5)
 
@@ -790,33 +750,6 @@ export function guardNote(w: { used: number; size: number }, pct: number, wmPath
 
 export const COMPACT_RETENTION = '[wb-ops] 压缩保留优先级：错误/警告行原文、文件路径+行号、[wb-ops] 标记及其落盘路径、最近 3 条用户指令原文；其余可安全摘要。';
 
-// register.ts 运行在 Mods 沙箱：无 Node 全局，$.fs.list 的条目形状宿主未文档化 → 归一化处理
-async function readStatRows($: any, dir: string): Promise<StatRow[]> {
-  let ents: unknown = [];
-  try {
-    ents = await $.fs.list(dir);
-  } catch {
-    return [];
-  }
-  const arr = Array.isArray(ents) ? ents : [];
-  const names: string[] = [];
-  for (const en of arr) {
-    if (typeof en === 'string') names.push(en);
-    else if (en && typeof (en as { name?: unknown }).name === 'string') names.push((en as { name: string }).name);
-  }
-  const rows: StatRow[] = [];
-  for (const name of names.filter(n => n.endsWith('.json')).slice(0, 500)) {
-    try {
-      const v = await $.fs.read(`${dir}/${name}`);
-      const txt = typeof v === 'string' ? v : v && typeof (v as { text?: unknown }).text === 'string' ? (v as { text: string }).text : '';
-      if (!txt) continue;
-      const j = JSON.parse(txt) as Record<string, number & string & { kinds?: StatRow['kinds'] }>;
-      rows.push({ file: name, calls: j.calls || 0, before: j.before || 0, after: j.after || 0, tokBefore: j.tokBefore || 0, tokAfter: j.tokAfter || 0, tool: j.tool, ts: j.ts, kinds: j.kinds });
-    } catch { /* 单文件坏不影响整体 */ }
-  }
-  return rows;
-}
-
 // ------------------------------------------------------------------ entry
 
 function toolPathOf(e: any): string | null {
@@ -918,71 +851,36 @@ function makeHandler(kind: string) {
 }
 
 /**
- * 报表工具注册：宿主有**两条能力不同的 core**（2026-11-05 实测 bundle 结论）——
- *   ① 应用级 core（`hostBindings` → `createModsCommandToolBindings`）：`registerTool` 有真实现
- *      → `toolManager.register(ModProxyTool)`，真注册成功（CLI 路径走这条，探针实测 `registerResult={tool:"mcp__wbopsprobe__probereport"}`）。
- *   ② 会话级 core（`createFunctionalHookBindings`）：`registerTool` 被宿主显式绑成
- *      `throw Error("Session tool registration is not bound")` → 必抛错（GUI 路径走这条）。
- * 结论：**`session.start` 这一个时机不够**——GUI 会话拿到的 core 不支持注册工具。
- * 修法：把注册做成「幂等 + 多入口重试」，凡拿到任何可用 core 的时机都试一次；
- * 失败不抛（fail-open），下次入口再试。
+ * 报表工具（#3）：v0.14 起**不再由 mod 注册**——改由插件清单声明 MCP 服务器
+ * （.codebuddy-plugin/plugin.json 的 mcpServers.wb_ops → mcp/server.mjs），工具名 mcp__wb_ops__report。
  *
- * 状态放在 register() 的闭包里（**不是模块级**）：模块级会让「上一个会话已注册」直接短路掉
- * 新会话的注册——宿主每会话重新引导 mod，工具名要每会话重新拿一次。
+ * 这段是本项目最长的一次返工，别再改回去（2026-11-05 读宿主 bundle 的实测结论）：
+ *   宿主有两套 core，能力不同，且**不由时机决定**——
+ *   ① 应用级 core（bootstrapFunctionHookMods → hostBindings → createModsCommandToolBindings）：
+ *      registerTool 有真实现（toolManager.register(ModProxyTool)），CLI 探针实测返回
+ *      {tool:"mcp__wbopsprobe__probereport"}。
+ *   ② 会话级 core（createFunctionalHooks → makeCore）：registerTool 被**硬绑**成
+ *      `() => { throw Error("Session tool registration is not bound") }`。
+ *   GUI 会话里 mod 的每个钩子（session.start / prompt.submit / …）拿到的都是同一个 ② 号 core，
+ *   所以 v0.13.1 的「多入口重试」在 GUI 下必然徒劳——差别不在时机，在 core。
+ *   MCP 服务器由宿主 MCP 管理器起进程并注册工具，与 mod core 无关，两条路径都通
+ *   （旁证：内置插件 builtin-calendar / workbuddy-sheetagent 就是这么声明的）。
+ *
+ * 本函数因此只剩三件事：压缩、水位守卫、压缩保留指示——全部 fail-open，报表是纯增强项。
  */
 export function register(on: On, _options?: unknown): void {
-  let reportToolName: string | null = null; // $.tool.register 返回值，形如 mcp__wb_ops__report
-
-  const tryRegisterReportTool = async ($: any): Promise<void> => {
-    if (reportToolName) return;                     // 已注册 → 幂等，不重复
-    try {
-      const cfg = await readCfg($);
-      if (!cfg.enabled || !cfg.stats) return;       // 关了就不注册（token 经济自洽）
-      if (!($ && $.tool && typeof $.tool.register === 'function')) return;
-      const r = await $.tool.register({
-        name: 'report',
-        description: 'wb-ops 节省报表：各会话压缩次数、原文/压缩后字节、节省比例',
-        inputSchema: { type: 'object', properties: {} },
-      });
-      if (r && typeof r.tool === 'string') reportToolName = r.tool;
-    } catch { /* 本次 core 不支持注册（如 GUI 会话级 core）→ 换入口再试 */ }
-  };
-
   for (const tool of Object.keys(POLICY)) {
     on('tool.call', { tool }, makeHandler(POLICY[tool]));
   }
   // ③ 通配兜底：所有未列策略的工具（MCP 工具、宿主新增工具）过同一套通用压缩。
-  // 谓词每次事件重评（文档 mods.txt「深匹配」节），故排除自身报表工具用模块变量即可。
+  // 谓词每次事件重评（文档 mods.txt「深匹配」节）。
   // 预算内的输出本来就原样透传——兜底只碰真正超线的，Edit/Write 这类小结果零影响。
-  on('tool.call', { tool: (v: unknown) => typeof v === 'string' && !KNOWN_TOOLS.has(v) && v !== reportToolName }, makeHandler('other'));
-
-  // #3 报表：仅当用户开了 WB_OPS_STATS 才注册工具——不记账时不往提示词里塞 schema（token 经济自洽）
-  // 注册挂在**两个**入口：session.start（应用级 core 有真绑定时命中）与 prompt.submit
-  // （GUI 会话走宿主会话级 core，session.start 那次注册必抛错，prompt.submit 是第二个机会）。
-  // 两者都失败也无所谓——报表是增强项，主链路（压缩/落盘/水位）完全不依赖它。
-  on('session.start', async ($: any, e: any, next: any) => {
-    await tryRegisterReportTool($);
-    return next(e);
-  });
-
-  on('tool.call', { tool: (v: unknown) => !!reportToolName && v === reportToolName }, async ($: any, _e: any, _next: any) => {
-    try {
-      const cfg = await readCfg($);
-      if (!cfg.stats || !cfg.home) return { result: '[wb-ops] 报表未启用（设 WB_OPS_STATS=1 后重启会话）' };
-      const dir = `${cfg.home.replace(/\\/g, '/')}/.workbuddy/wb-ops/stats`;
-      return { result: renderSummary(await readStatRows($, dir)) };
-    } catch (err) {
-      return { result: `[wb-ops] 报表读取失败: ${String(err)}` }; // fail-open：工具本身不炸引擎
-    }
-  });
+  on('tool.call', { tool: (v: unknown) => typeof v === 'string' && !KNOWN_TOOLS.has(v) }, makeHandler('other'));
 
   // #4 水位守卫：每轮用户提交查一次 $.session.usage()（进程内 O(1)，非 sana 那种 16MB transcript 尾扫）
   // 越线才改写：契约 {text, context:string[]}，context 数组随 prompt 进模型（bundle @2099903 合并逻辑）
   on('prompt.submit', async ($: any, e: any, next: any) => {
     try {
-      // 报表工具注册的**第二个入口**：GUI 会话级 core 不支持注册工具（宿主把 registerTool 绑成 throw），
-      // session.start 那次会失败；这里每轮再试一次（幂等，已注册则 O(1) 返回）。
-      await tryRegisterReportTool($);
       const cfg = await readCfg($);
       if (cfg.enabled && cfg.guard) {
         // 一次读取两用：① 探测真实形状（写 debug，只记结构/数值）② 喂水位守卫

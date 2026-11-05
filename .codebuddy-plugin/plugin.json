@@ -1,6 +1,14 @@
 {
   "name": "wb-ops",
-  "version": "0.13.1",
-  "description": "WorkBuddy 上下文治理 Mod（Mod-first）：进程内 tool.call 确定性压缩 + 原文落盘回查 + shell 失败 nextAction 提示 + 省量报表 + 水位守卫与压缩保留指示。v0.13.1 修复报表工具在 GUI 会话注册不上：宿主会话级 core 把 registerTool 绑成 throw（Session tool registration is not bound），注册改为 session.start + prompt.submit 双入口幂等重试，工具名状态收敛到 register() 闭包（每会话独立）。v0.13 token 指标：每次压缩的标记行内联“原文 …≈N tok → ≈M tok（省 P%）”（与宿主 TokenUtils 同公式估算），记账含 tokBefore/tokAfter、默认开（WB_OPS_STATS=0 关），report 工具与 report.mjs 同口径；v0.12.1 大 transcript（>8MB）不再整体拒绝，改为尾部采样降级（fs.stat 预判 + truncated 标记）；v0.12 适配宿主 $.session.usage() 嵌套 context 形状 + transcript 尾部采样 fallback + 沙箱读权限探测；v0.11 起支持 Grep/Glob 原生 string[]、4500B 预算与形状诊断。零子进程，fail-open。",
-  "defaultEnabled": true
+  "version": "0.14.0",
+  "description": "WorkBuddy 上下文治理 Mod（Mod-first）：进程内 tool.call 确定性压缩 + 原文落盘回查 + shell 失败 nextAction 提示 + 省量报表 + 水位守卫与压缩保留指示。v0.14 报表工具改为插件清单声明 MCP 服务器（mcpServers.wb_ops → mcp/server.mjs，工具名 mcp__wb_ops__report）：宿主 GUI 会话的 mod core 把 registerTool 硬绑成 throw，换任何钩子时机都注册不上，MCP 通道与 mod core 无关故两条路径都通；报表渲染下沉到 lib/report-core.mjs，MCP 工具与 report.mjs CLI 共用一份口径。v0.13 token 指标：每次压缩的标记行内联“原文 …≈N tok → ≈M tok（省 P%）”（与宿主 TokenUtils 同公式估算），记账含 tokBefore/tokAfter、默认开（WB_OPS_STATS=0 关）；v0.12.1 大 transcript（>8MB）改为尾部采样降级；v0.12 适配宿主 $.session.usage() 嵌套 context 形状 + transcript 尾部采样 fallback；v0.11 起支持 Grep/Glob 原生 string[]。热路径零子进程，fail-open。",
+  "defaultEnabled": true,
+  "mcpServers": {
+    "wb_ops": {
+      "command": "node",
+      "args": [
+        "${CODEBUDDY_PLUGIN_ROOT}/mcp/server.mjs"
+      ]
+    }
+  }
 }
