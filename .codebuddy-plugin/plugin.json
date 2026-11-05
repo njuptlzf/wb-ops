@@ -1,6 +1,6 @@
 {
   "name": "wb-ops",
-  "version": "0.11.0",
-  "description": "WorkBuddy 上下文治理 Mod（Mod-first）：进程内 tool.call 确定性压缩 + 原文落盘回查 + shell 失败 nextAction 提示 + 省量报表 + 水位守卫与压缩保留指示。v0.11 适配宿主 Grep/Glob 原生字符串数组形态（jsonlist 通道恢复）+ 默认预算降至 4500（宿主 persisted-output 阈值 ~8KB 之下）+ 形状诊断通道（只记结构不记正文）+ usage 形状探测。零子进程，fail-open。",
+  "version": "0.12.0",
+  "description": "WorkBuddy 上下文治理 Mod（Mod-first）：进程内 tool.call 确定性压缩 + 原文落盘回查 + shell 失败 nextAction 提示 + 省量报表 + 水位守卫与压缩保留指示。v0.12 适配宿主 $.session.usage() 嵌套 context 形状 + transcript 尾部采样 fallback（宿主 binding tokens 恒 0 时仍能取真实上下文占用）+ 沙箱读权限探测；v0.11 起支持 Grep/Glob 原生 string[]、4500B 预算与形状诊断。零子进程，fail-open。",
   "defaultEnabled": true
 }

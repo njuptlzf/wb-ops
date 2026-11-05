@@ -5,9 +5,9 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { register, compress, compressList, trimList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, summarizeStats, renderSummary, pickWatermark, guardNote, describeShape, hasLongString, toolNameOf, probeUsage, COMPACT_RETENTION } from '../hooks/register.ts';
+import { register, compress, compressList, trimList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, summarizeStats, renderSummary, pickWatermark, pickWindow, projectSlug, lastInputTokens, probeTranscript, watermarkLine, guardNote, describeShape, hasLongString, toolNameOf, probeUsage, COMPACT_RETENTION } from '../hooks/register.ts';
 
-function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean; listFail?: boolean; list?: unknown[]; files?: Record<string, string>; usage?: unknown; usageFail?: boolean } = {}) {
+function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean; listFail?: boolean; list?: unknown[]; files?: Record<string, string>; usage?: unknown; usageFail?: boolean; cwd?: string } = {}) {
   const writes: { path: string; text: string }[] = [];
   const reads: string[] = [];
   const byTool: Record<string, ($: any, e: any, next: any) => Promise<any>> = {};
@@ -41,6 +41,7 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
     },
     session: {
       id: async () => 'deadbeef-0000-1111',
+      cwd: async () => opts.cwd ?? 'C:\\Users\\dev\\work\\wb-ops',
       usage: async () => {
         usageCalls.push(1);
         if (opts.usageFail) throw new Error('usage unavailable');
@@ -214,7 +215,9 @@ test('落盘失败：仍压缩，但标记如实说明未保留', async () => {
 });
 
 test('原文超过 4MB 落盘门槛：仍压缩但不写盘，标记如实说明', async () => {
-  const h = harness({ env: HOME });
+  // 4.6MB 输入本身就可能撞上默认 100ms 软超时（机器忙时压缩自弃）→ 放大 deadline 隔离时间变量，
+  // 本用例只验证「过大不落盘 + 诚实标注」，不测超时。
+  const h = harness({ env: { ...HOME, WB_OPS_DEADLINE_MS: '10000' } });
   const { out } = await h.bash(bigText(45000)); // ≈4.6MB
   assert.equal(h.writes.length, 0, '过大不写');
   assert.ok(((out as any).result as string).includes('未落盘（原文过大'), '仍压缩，且诚实标注原因');
@@ -851,4 +854,116 @@ test('usage 探测：形状未变不重复落盘（热路径纪律）', async ()
   await h.firePrompt();
   const second = h.writes.filter((w) => w.path.includes('/wb-ops/debug/usage-')).length;
   assert.equal(first, second, '形状没变不重复写');
+});
+
+// ---------------------------------------------------------------- v0.12 水位数据源
+
+const SID = 'deadbeef-0000-1111';
+const SLUG = 'c-Users-dev-work-wb-ops';
+const TX_PATH = `C:/tmp-home/.workbuddy/projects/${SLUG}/${SID}.jsonl`;
+const ZERO_USAGE = { context: { tokens: 0, window: 300000, percent: 0 }, rateLimits: [] };
+
+/** 造一份最小 transcript：尾部一条模型响应带真实 inputTokens（含 cache_read 子集，不另加）。 */
+function transcript(last = 71198): string {
+  const rows = [
+    { providerData: { usage: { requests: 1, inputTokens: 31737, outputTokens: 836, inputTokensDetails: [{ cached_tokens: 13120 }] } } },
+    { type: 'function_call_result', result: 'noise with inputTokens text but no numbers' },
+    { providerData: { usage: { requests: 1, inputTokens: last, outputTokens: 1024 } }, message: { usage: { input_tokens: last, cache_read_input_tokens: 69376 } } },
+  ];
+  return rows.map((r) => JSON.stringify(r)).join('\n') + '\n';
+}
+
+test('v0.12 pickWatermark：宿主嵌套 context.{tokens,window} 形状 + tokens=0 视为无数据', () => {
+  assert.deepEqual(pickWatermark({ context: { tokens: 71198, window: 300000, percent: 24 }, rateLimits: [] }), { used: 71198, size: 300000 });
+  assert.equal(pickWatermark(ZERO_USAGE), null, '宿主 binding 恒 0 时不假报水位');
+  assert.equal(pickWatermark({ context: { tokens: -1, window: 300000 } }), null);
+  assert.equal(pickWatermark({ context: { tokens: 100, window: 0 } }), null);
+  assert.equal(pickWindow(ZERO_USAGE), 300000, 'window 是真算的，恒 0 时也要能取出来');
+  assert.equal(pickWindow({ size: 20000 }), 20000, '老形状兼容');
+  assert.equal(pickWindow({ mystery: true }), 0);
+});
+
+test('v0.12 projectSlug：Windows / Git Bash 路径都归一到宿主目录名', () => {
+  assert.equal(projectSlug('C:\\Users\\dev\\work\\wb-ops'), SLUG);
+  assert.equal(projectSlug('C:/Users/dev/work/wb-ops/'), SLUG);
+  assert.equal(projectSlug('/c/Users/dev/work/wb-ops'), SLUG);
+  assert.equal(projectSlug(''), '');
+});
+
+test('v0.12 lastInputTokens：尾部逆扫 / 坏行跳过 / 40 行封顶 / 不重复叠加 cache_read', () => {
+  assert.equal(lastInputTokens(transcript()), 71198);
+  assert.equal(lastInputTokens(transcript(120000)), 120000);
+  assert.equal(lastInputTokens('{"x":1}\nnot json {inputTokens: 5}\n'), undefined, '坏行不误判');
+  assert.equal(lastInputTokens(''), undefined);
+  const far = Array.from({ length: 3 }, (_, i) => JSON.stringify({ providerData: { usage: { inputTokens: i + 1 } } }))
+    .concat(Array.from({ length: 45 }, () => '{"noise":1}')).join('\n');
+  assert.equal(lastInputTokens(far), undefined, '回看封顶 40 行，不整篇扫描');
+});
+
+test('v0.12 读权限探测：直接命中 slug 路径 + 只回传结构不回传正文', async () => {
+  const h = harness({ env: HOME, files: { [TX_PATH]: transcript() } });
+  const p = await probeTranscript(h.$, 'C:/tmp-home', SID, 'C:\\Users\\dev\\work\\wb-ops');
+  assert.equal(p.used, 71198);
+  assert.equal(p.path, TX_PATH);
+  assert.ok(p.bytes && p.bytes > 0);
+  assert.equal(p.err, undefined);
+});
+
+test('v0.12 读权限探测：slug 猜不中 → 列目录找 <sid>.jsonl（自定义 cwd 场景）', async () => {
+  const p2 = `C:/tmp-home/.workbuddy/projects/custom-dir/${SID}.jsonl`;
+  const h = harness({ env: HOME, cwd: '', list: ['custom-dir'], files: { [p2]: transcript(90000) } });
+  const p = await probeTranscript(h.$, 'C:/tmp-home', SID, '');
+  assert.equal(p.used, 90000);
+  assert.equal(p.path, p2);
+});
+
+test('v0.12 读权限探测：沙箱拒绝读 → 有 err 不抛；projects 目录可用 WB_OPS_PROJECTS 覆盖', async () => {
+  const h1 = harness({ env: HOME, readFail: true });
+  const p1 = await probeTranscript(h1.$, 'C:/tmp-home', SID, 'C:\\Users\\dev\\work\\wb-ops');
+  assert.ok(p1.err && !p1.used, '读失败只回 err');
+  const p3 = `C:/custom/${SLUG}/${SID}.jsonl`;
+  const h2 = harness({ env: { ...HOME, WB_OPS_PROJECTS: 'C:/custom' }, files: { [p3]: transcript(50000) } });
+  const p2 = await probeTranscript(h2.$, 'C:/tmp-home', SID, 'C:\\Users\\dev\\work\\wb-ops', 'C:/custom');
+  assert.equal(p2.used, 50000);
+  assert.equal(p2.path, p3);
+});
+
+test('v0.12 水位守卫：宿主 usage 恒 0 → transcript fallback 点亮提醒与余量文件', async () => {
+  const h = harness({
+    env: { ...HOME, WB_OPS_GUARD_PCT: '10' }, usage: ZERO_USAGE,
+    files: { [TX_PATH]: transcript() },
+  });
+  const res = await h.firePrompt('继续');
+  assert.equal(res.text, '继续');
+  assert.equal(res.context.length, 1, '71198/300000≈24% 越 10% 阈值必须提醒');
+  assert.match(res.context[0], /wb-ops 水位/);
+  const wm = h.writes.find((w) => w.path.endsWith('/wb-ops/watermark/deadbeef.num'));
+  assert.ok(wm, '余量文件已写');
+  assert.ok(wm.text.includes('来源 transcript'), '数值行标明数据源');
+  assert.ok(h.writes.some((w) => w.path.includes('/wb-ops/debug/fsprobe-')), '沙箱读权限探测落盘');
+  const dbg = h.writes.find((w) => w.path.includes('/wb-ops/debug/fsprobe-'));
+  assert.ok(!dbg.text.includes('noise') && !dbg.text.includes('function_call_result'), 'debug 不含正文');
+});
+
+test('v0.12 水位守卫：transcript 读不到/读抛错 → 静默，恒等透传（fail-open）', async () => {
+  const h1 = harness({ env: HOME, usage: ZERO_USAGE });
+  assert.deepEqual(await h1.firePrompt('hi'), { text: 'hi' });
+  assert.ok(h1.writes.some((w) => w.path.includes('/wb-ops/debug/fsprobe-')), '失败也记一条探测');
+  const h2 = harness({ env: HOME, usage: ZERO_USAGE, readFail: true });
+  assert.deepEqual(await h2.firePrompt('hi'), { text: 'hi' });
+});
+
+test('v0.12 WB_OPS_GUARD_FS=0 → 零 transcript IO；宿主自己出数时不走 fallback', async () => {
+  const h1 = harness({ env: { ...HOME, WB_OPS_GUARD_FS: '0' }, usage: ZERO_USAGE, files: { [TX_PATH]: transcript() } });
+  assert.deepEqual(await h1.firePrompt('hi'), { text: 'hi' });
+  assert.ok(!h1.reads.some((r) => r.includes('/projects/')), '关掉后不碰 transcript');
+  const h2 = harness({ env: HOME, usage: { used: 500, size: 1000 }, files: { [TX_PATH]: transcript() } });
+  await h2.firePrompt('hi');
+  assert.ok(!h2.reads.some((r) => r.includes('/projects/')), 'usage 自己有数时不读 transcript');
+});
+
+test('v0.12 watermarkLine 数据源标注（老调用不传参保持兼容）', () => {
+  assert.match(watermarkLine({ used: 100, size: 200 }), /已用 100\/200 tok/);
+  assert.match(watermarkLine({ used: 100, size: 200 }, 'transcript'), /来源 transcript/);
+  assert.ok(!watermarkLine({ used: 100, size: 200 }).includes('来源'), '默认不加标注');
 });

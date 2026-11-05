@@ -105,7 +105,7 @@ export function hintFor(raw: string): string | null {
   return null;
 }
 
-interface Cfg { enabled: boolean; budget: number; deadlineMs: number; home: string; stats: boolean; hints: boolean; guard: boolean; guardPct: number; fallback: boolean; }
+interface Cfg { enabled: boolean; budget: number; deadlineMs: number; home: string; stats: boolean; hints: boolean; guard: boolean; guardPct: number; guardFs: boolean; projects: string; fallback: boolean; }
 type Sink = { put: (s: string | string[]) => unknown };
 export interface Compression { text: string; dropped: number; }
 /** extractText 的产物：raw = 可压缩的纯文本；items = 原生字符串数组（宿主 Grep/Glob 形态）；isArray = sink 收数组而非文本。 */
@@ -474,6 +474,11 @@ async function readCfg($: any): Promise<Cfg> {
     hints: !/^(0|off|false|no)$/i.test((await g('WB_OPS_HINTS')).trim()),
     guard: !/^(0|off|false|no)$/i.test((await g('WB_OPS_GUARD')).trim()),
     guardPct: gpct > 0 && gpct < 100 ? gpct : DEFAULT_GUARD_PCT,
+    // v0.12：宿主 mods 的 $.session.usage() 恒 0（快照没接上），guard 的 fallback 数据源 =
+    // transcript 尾部采样。整链路 fail-open，WB_OPS_GUARD_FS=0 可单独关掉；WB_OPS_PROJECTS
+    // 可覆盖 projects 目录（CLI 自定义 CODEBUDDY_CONFIG_DIR 时 HOME 推导会错）。
+    guardFs: !/^(0|off|false|no)$/i.test((await g('WB_OPS_GUARD_FS')).trim()),
+    projects: (await g('WB_OPS_PROJECTS')).trim(),
     fallback: !/^(0|off|false|no)$/i.test((await g('WB_OPS_FALLBACK')).trim()),
   };
 }
@@ -482,6 +487,22 @@ let seq = 0;
 
 async function getSid8($: any): Promise<string> {
   try { return String(await $.session.id()).slice(0, 8); } catch { return 'nosid'; }
+}
+
+/** transcript 文件名用完整 session id（不是 sid8）；拿不到就 'nosid'，调用方据此跳过采样。 */
+async function getFullSid($: any): Promise<string> {
+  try { return String(await $.session.id()); } catch { return 'nosid'; }
+}
+
+/** projects 目录 slug 依赖 cwd：宿主既暴露 $.session.cwd()，也可能只有 PWD（CLI 自定义配置时）。 */
+async function getCwd($: any): Promise<string> {
+  try {
+    if (typeof $.session?.cwd === 'function') {
+      const v = await $.session.cwd();
+      if (typeof v === 'string' && v) return v;
+    }
+  } catch { /* 落到 PWD */ }
+  try { const v = await $.env.get('PWD'); return typeof v === 'string' ? v : ''; } catch { return ''; }
 }
 
 async function spillRaw($: any, e: any, text: string, home: string, sid: string, ext: string): Promise<string | null> {
@@ -555,13 +576,17 @@ export function renderSummary(rows: StatRow[]): string {
 // ---------------------------------------------------------------- guard (#4/#5)
 
 let lastUsageSig: string | null = null;   // usage 形状签名：变了才落盘（每轮写盘违反热路径纪律）
+let lastFsSig: string | null = null;      // transcript 读权限探测签名（成功/失败原因变了才落盘）
 
 /**
  * usage 探测：拿真实返回形状（只记结构，不记内容），同时把原值交回水位守卫。
- * 宿主契约实测（bundle）：`i.usage ? core_handler_value(await i.usage(h)) : deny("$.session.usage", …)`
- * —— core_handler_value 把值包成 {value:…}，deny 包成 {deny:"… is unavailable: …"}；
- * 宿主 session 自身还有 usage?.outputTokens（**"本轮 token 统计"味道，未见"上下文占用/窗口"语义**）。
- * 语义未确认前守卫只判形状不猜含义：判不出 → 静默，绝不误报。
+ * v0.12 宿主契约已实锤（shared.cjs）：`createModsUsageBinding` 返回
+ *   {context:{tokens,window,percent}, rateLimits:[]}
+ *   - window = resolveSessionContextBudget(...) —— **真算的，可信**
+ *   - tokens = getCurrentContextUsage(session)?.totalInputTokens ?? 0
+ *     → mods 持有的 session 上 getLatestUsageSnapshot 缺失 ⇒ 恒 0（宿主绑定层缺口，可报 issue）
+ * 数据本身没丢：宿主 ACP 的 usage_update 用 getLatestUsage()?.inputTokens，transcript JSONL
+ * 每条模型响应也带 providerData.usage.inputTokens（单调增长）。故 v0.12 加 transcript fallback。
  */
 export async function probeUsage($: any): Promise<{ value?: unknown; shape?: Record<string, unknown>; err?: string; deny?: string }> {
   try {
@@ -575,23 +600,115 @@ export async function probeUsage($: any): Promise<{ value?: unknown; shape?: Rec
   }
 }
 
-// $.session.usage() 返回形状宿主未文档化（bundle 里同时存在 {used,size} 与 {inputTokens,contextWindow} 两种构造）
-// → 多字段候选；判不出返回 null，守卫静默（对齐 sana 事故的根治：无阻塞、无扫描、可整体关闭）
+// $.session.usage() 的宿主形状未文档化：bundle 里同时存在 {used,size}、{inputTokens,contextWindow}
+// 与 v0.12 实测的嵌套 {context:{tokens,window,percent}} 三套构造 → 多字段候选。
+// tokens===0 视为「无数据」（真实会话上下文不可能为 0；宿主当前正卡在这个缺口上），
+// 判不出即返回 null，守卫静默（对齐 sana 事故的根治：无阻塞、无扫描、可整体关闭）。
 export function pickWatermark(u: unknown): { used: number; size: number } | null {
   if (!u || typeof u !== 'object') return null;
   const o = u as Record<string, unknown>;
   const num = (k: string): number | undefined =>
     typeof o[k] === 'number' && Number.isFinite(o[k]) ? (o[k] as number) : undefined;
-  const used = num('used') ?? num('inputTokens') ?? num('promptTokens') ?? num('totalTokens');
-  const size = num('size') ?? num('contextWindow') ?? num('maxInputTokens');
-  if (used === undefined || size === undefined || size <= 0 || used < 0) return null;
+  const c = o.context && typeof o.context === 'object' ? o.context as Record<string, unknown> : null;
+  const cn = (k: string): number | undefined =>
+    c && typeof c[k] === 'number' && Number.isFinite(c[k]) ? (c[k] as number) : undefined;
+  const used = num('used') ?? num('inputTokens') ?? num('promptTokens') ?? num('totalTokens') ?? cn('tokens');
+  const size = num('size') ?? num('contextWindow') ?? num('maxInputTokens') ?? cn('window');
+  if (used === undefined || size === undefined || size <= 0 || used <= 0) return null;
   return { used, size };
 }
 
+/** 只取窗口大小：宿主 binding 的 context.window 是真算的（本会话 300000），即使 tokens 恒 0 也可信。 */
+export function pickWindow(u: unknown): number {
+  if (!u || typeof u !== 'object') return 0;
+  const o = u as Record<string, unknown>;
+  const c = o.context && typeof o.context === 'object' ? o.context as Record<string, unknown> : null;
+  const vals: unknown[] = [o.size, o.contextWindow, o.maxInputTokens, c?.window, c?.size, c?.contextWindow];
+  for (const v of vals) if (typeof v === 'number' && Number.isFinite(v) && v > 0) return v;
+  return 0;
+}
+
+/** cwd → 宿主 projects 目录 slug（实测 C:/Users/dev/work/wb-ops → c-Users-dev-work-wb-ops）。 */
+export function projectSlug(cwd: string): string {
+  let p = (cwd || '').replace(/\\/g, '/').replace(/\/+$/, '');
+  const posix = /^\/([A-Za-z])\//.exec(p);      // Git Bash 的 /c/Users/... 也认
+  if (posix) p = posix[1].toLowerCase() + ':/' + p.slice(3);
+  return p.replace(/^([A-Za-z]):/, (_m, d: string) => d.toLowerCase()).replace(/\//g, '-');
+}
+
+/** JSONL 尾部逆扫最后一条模型响应的 inputTokens（已含 cache_read，不要再叠加），最多回看 40 行。 */
+export function lastInputTokens(txt: string): number | undefined {
+  const SCAN_LINES = 40, LINE_CAP = 2_000_000;
+  let end = txt.length;
+  while (end > 0 && (txt[end - 1] === '\n' || txt[end - 1] === '\r')) end--;
+  for (let seen = 0; end > 0 && seen < SCAN_LINES; seen++) {
+    let start = txt.lastIndexOf('\n', end - 1);
+    start = start < 0 ? 0 : start + 1;
+    const line = txt.slice(start, end);
+    end = start > 0 ? start - 1 : 0;
+    if (line.length > LINE_CAP) continue;
+    if (line.indexOf('inputTokens') < 0 && line.indexOf('input_tokens') < 0) continue;
+    try {
+      const o = JSON.parse(line) as Record<string, any>;
+      const vals = [o?.providerData?.usage?.inputTokens, o?.message?.usage?.input_tokens, o?.usage?.inputTokens];
+      for (const v of vals) if (typeof v === 'number' && Number.isFinite(v) && v > 0) return v;
+    } catch { /* 坏行/噪音行跳过 */ }
+  }
+  return undefined;
+}
+
+export interface TxProbe { used?: number; bytes?: number; path?: string; err?: string; }
+let txPathCache: { sid: string; base: string; path: string } | null = null;   // 命中后下轮直读，不再列目录
+
+/**
+ * v0.12 沙箱读权限探测 + fallback 水位源：读 <projects>/<slug>/<sid>.jsonl 的最后一条 usage。
+ * 只发生在 prompt.submit（每轮用户提交一次），不是 tool.call 热路径；任何失败都返回 err 而不抛。
+ * 路径推导失败时列一次目录找 <sid>.jsonl（兼容宿主改 slug 规则 / 自定义 projects 目录）。
+ * 绝不把正文写进 debug：只回传 used/bytes/path/err。
+ */
+export async function probeTranscript($: any, home: string, sid: string, cwd: string, projectsDir?: string): Promise<TxProbe> {
+  if (!home) return { err: 'no home' };
+  if (!sid || sid === 'nosid') return { err: 'no sid' };
+  const base = (projectsDir || `${home.replace(/\\/g, '/')}/.workbuddy/projects`).replace(/\\/g, '/').replace(/\/+$/, '');
+  let lastErr = '';
+  const readOne = async (p: string): Promise<TxProbe | null> => {
+    try {
+      const v = await $.fs.read(p);
+      const txt = typeof v === 'string' ? v : v && typeof (v as { text?: unknown }).text === 'string' ? (v as { text: string }).text : '';
+      if (!txt) return null;
+      if (txt.length > MAX_INPUT_BYTES) return { err: 'transcript too big', bytes: txt.length, path: p };
+      return { used: lastInputTokens(txt), bytes: txt.length, path: p };
+    } catch (e) { lastErr = String(e); return null; }
+  };
+  const slug = projectSlug(cwd);
+  const wants: string[] = [];
+  if (txPathCache?.sid === sid && txPathCache.base === base) wants.push(txPathCache.path);
+  if (slug) wants.push(`${base}/${slug}/${sid}.jsonl`);
+  for (const p of wants) {
+    const got = await readOne(p);
+    if (got) { if (got.used) txPathCache = { sid, base, path: got.path! }; return got; }
+  }
+  // slug 猜不中才列目录；读到第 3 个目录仍失败就停（多半是 fs 权限，别把目录扫穿）
+  try {
+    const ents: unknown = await $.fs.list(base);
+    const arr = Array.isArray(ents) ? ents : [];
+    let tried = 0, fails = 0;
+    for (const en of arr) {
+      const name = typeof en === 'string' ? en : en && typeof (en as { name?: unknown }).name === 'string' ? (en as { name: string }).name : '';
+      if (!name || tried >= 40) break;
+      tried++;
+      const got = await readOne(`${base}/${name}/${sid}.jsonl`);
+      if (got) { if (got.used) txPathCache = { sid, base, path: got.path! }; return got; }
+      if (++fails >= 3) break;             // 连续 3 个读不到：多半是 fs 权限，别扫穿目录
+    }
+  } catch (e) { lastErr = lastErr || String(e); }
+  return { err: lastErr || 'transcript not found' };
+}
+
 /** ② 水位数值行：sana ctx-guard 的 budget/<sid8>.num 等价物——模型可 Read 的纯文本余量。 */
-export function watermarkLine(w: { used: number; size: number }): string {
+export function watermarkLine(w: { used: number; size: number }, source = 'usage'): string {
   const pct = ((w.used / w.size) * 100).toFixed(1);
-  return `${w.size - w.used}\n已用 ${w.used}/${w.size} tok（${pct}%）· ${new Date().toISOString()}`;
+  return `${w.size - w.used}\n已用 ${w.used}/${w.size} tok（${pct}%）· ${new Date().toISOString()}${source !== 'usage' ? ' · 来源 ' + source : ''}`;
 }
 
 export function guardNote(w: { used: number; size: number }, pct: number, wmPath?: string): string | null {
@@ -784,7 +901,20 @@ export function register(on: On, _options?: unknown): void {
             await writeDebug($, cfg.home, await getSid8($), 'usage', { shape: probe.shape, deny: probe.deny, err: probe.err });
           }
         }
-        const w = pickWatermark(probe.value);
+        let w = pickWatermark(probe.value);
+        let source = 'usage';
+        if (!w && cfg.guardFs) {
+          // v0.12：宿主 binding 的 tokens 恒 0 → 从 transcript 尾部取真实 inputTokens，
+          // 窗口仍用 usage().context.window（真算的）。同一次读取兼作沙箱读权限探测。
+          const tp = await probeTranscript($, cfg.home, await getFullSid($), await getCwd($), cfg.projects);
+          const fsSig = JSON.stringify({ ok: !!tp.used, err: tp.err ?? null, path: tp.path ?? null, bytes: tp.bytes ?? null });
+          if (fsSig !== lastFsSig) {   // 权限结论没变就不重复落盘
+            lastFsSig = fsSig;
+            await writeDebug($, cfg.home, await getSid8($), 'fsprobe', { source: 'transcript', ...tp });
+          }
+          const size = pickWindow(probe.value);
+          if (tp.used && size > 0) { w = { used: tp.used, size }; source = 'transcript'; }
+        }
         let note: string | null = null;
         if (w) {
           // ② 每轮把余量写进 <sid8>.num（几十字节小文件，进程内 fs）——越线提醒之外让模型可主动查
@@ -792,7 +922,7 @@ export function register(on: On, _options?: unknown): void {
           try {
             if (cfg.home) {
               wmPath = `${cfg.home.replace(/\\/g, '/')}/.workbuddy/wb-ops/watermark/${await getSid8($)}.num`;
-              await $.fs.write(wmPath, watermarkLine(w));
+              await $.fs.write(wmPath, watermarkLine(w, source));
             }
           } catch { wmPath = undefined; }
           note = guardNote(w, cfg.guardPct, wmPath);
