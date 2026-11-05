@@ -9,7 +9,7 @@
 | v0.13 | 2026-11-05 | ✅ token 指标真机生效（标记行内联省量 + 记账 tok 字段 + 报表同口径） | `9554320` |
 | v0.13.1 | 2026-11-05 | ❌ **修法无效**（GUI 换入口换不到可用 core；新会话复核未通过，见 3.6 警告与 3.7） | `429e616` |
 | v0.14 | 2026-11-05 | ✅ 报表工具改走插件声明的 MCP 服务器（安装态握手通过；GUI 新会话待最终确认） | `9b360cf` |
-| v0.15 | 2026-11-05 | ✅ Web 看板 `scripts/dashboard.mjs`（离线单测 6 项 + 本机真实账本渲染通过；GUI 侧无新运行面） | `e4474a5` |
+| v0.15 | 2026-11-05 | ✅ Web 看板 `scripts/dashboard.mjs`（离线单测 6 项 + 本机真实账本渲染通过；GUI 侧无新运行面） | `df8a267` |
 
 离线单测：**100/100 全绿**（`node --test test/register.test.ts`（94）+ `node --test test/dashboard.test.mjs`（6））。宿主校验器：`plugin validate` ✔、`plugin list` → `enabled`。安装态探针：`node test/probe-installed-mcp.mjs` ✔。
 
