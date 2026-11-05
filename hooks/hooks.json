@@ -1,5 +1,5 @@
 {
-  "description": "wb-ops 0.12.0: Mods 通道（仅 modules，无 shell hooks——刻意不用 UserPromptSubmit/PostToolUse 子进程；v0.12 的 transcript 尾部采样只在 prompt.submit 进程内进行，见 README 事故分析）。",
+  "description": "wb-ops 0.13.0: Mods 通道（仅 modules，无 shell hooks——刻意不用 UserPromptSubmit/PostToolUse 子进程；v0.12 的 transcript 尾部采样只在 prompt.submit 进程内进行，见 README 事故分析）。",
   "modules": [
     "./register.ts"
   ]

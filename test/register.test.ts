@@ -5,7 +5,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { register, compress, compressList, trimList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, summarizeStats, renderSummary, pickWatermark, pickWindow, projectSlug, lastInputTokens, probeTranscript, watermarkLine, guardNote, describeShape, hasLongString, toolNameOf, probeUsage, COMPACT_RETENTION } from '../hooks/register.ts';
+import { register, compress, compressList, trimList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, summarizeStats, renderSummary, estTokens, pickWatermark, pickWindow, projectSlug, lastInputTokens, probeTranscript, watermarkLine, guardNote, describeShape, hasLongString, toolNameOf, probeUsage, COMPACT_RETENTION } from '../hooks/register.ts';
 
 function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean; listFail?: boolean; list?: unknown[]; files?: Record<string, string>; usage?: unknown; usageFail?: boolean; cwd?: string } = {}) {
   const writes: { path: string; text: string }[] = [];
@@ -19,8 +19,11 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
     hooks.push({ ev, matcher: m, h });
   }) as any);
   const usageCalls: number[] = [];
+  // 测试默认关记账（老用例只关心 spill 写数）；要测记账的用例显式给 WB_OPS_STATS；
+  // 测"未设=默认开"的用例传 WB_OPS_STATS: undefined。
+  const ENV: Record<string, string | undefined> = { WB_OPS_STATS: '0', ...(opts.env ?? {}) };
   const $ = {
-    env: { get: async (k: string) => opts.env?.[k] },
+    env: { get: async (k: string) => ENV[k] },
     tool: { register: async (spec: any) => { regCalls.push(spec); return { tool: 'mcp__wb_ops__report' }; } },
     fs: {
       write: async (p: string, t: string) => {
@@ -263,7 +266,7 @@ test('并发 50 次：spill 路径互不覆盖', async () => {
   const byTool: Record<string, any> = {};
   register(((ev: string, m: any, h: any) => { byTool[m.tool] = h; }) as any);
   const $ = {
-    env: { get: async (k: string) => k === 'USERPROFILE' ? 'C:/tmp-home' : undefined },
+    env: { get: async (k: string) => k === 'USERPROFILE' ? 'C:/tmp-home' : k === 'WB_OPS_STATS' ? '0' : undefined },
     fs: { write: async (p: string) => { writes.push(p); } },
     session: { id: async () => 'sess0001-aaaa' },
   };
@@ -409,8 +412,8 @@ test('PowerShell/TaskOutput 与 Bash 同策略；无退出码行也照压', asyn
 
 // ---------------------------------------------------------------- Batch C：记账
 
-test('WB_OPS_STATS 未设：热路径零统计 IO', async () => {
-  const h = harness({ env: HOME });
+test('WB_OPS_STATS=0：热路径零统计 IO', async () => {
+  const h = harness({ env: { ...HOME, WB_OPS_STATS: '0' } });
   await h.bash(bigText());
   assert.equal(h.writes.length, 1, '只有 spill');
   assert.equal(h.reads.length, 0);
@@ -425,7 +428,20 @@ test('WB_OPS_STATS=1：写会话计数器，省量可查', async () => {
   assert.equal(j.calls, 1);
   assert.ok(j.before > 100000 && j.after < 9500 && j.before > 3 * j.after, `before=${j.before} after=${j.after}`);
   assert.equal(j.tool, 'shell');
-  assert.deepEqual(j.kinds.shell, { calls: 1, before: j.before, after: j.after }, '① by-kind 细分同口径');
+  assert.deepEqual(j.kinds.shell, { calls: 1, before: j.before, after: j.after, tokBefore: j.tokBefore, tokAfter: j.tokAfter }, '① by-kind 细分同口径');
+  assert.ok(j.tokBefore > 20000 && j.tokBefore > 3 * j.tokAfter, `tokBefore=${j.tokBefore} tokAfter=${j.tokAfter}`);
+});
+
+test('WB_OPS_STATS 未设（v0.13 默认开）：写计数并带 token 口径，标记行内联省量', async () => {
+  const h = harness({ env: { ...HOME, WB_OPS_STATS: undefined } });
+  const { out } = await h.bash(bigText());
+  const stat = h.writes.find((w) => w.path.includes('/stats/'));
+  assert.ok(stat, '默认开：计数器落盘 ' + h.writes.map((w) => w.path).join());
+  const j = JSON.parse(stat!.text);
+  assert.ok(j.tokBefore > 20000 && j.tokBefore > 3 * j.tokAfter, `tokBefore=${j.tokBefore} tokAfter=${j.tokAfter}`);
+  assert.ok(j.kinds.shell.tokBefore > 0, '按类也带 token');
+  const txt = (out as any).result as string;
+  assert.match(txt, /≈[\d.]+k? tok → ≈[\d.]+k? tok（省 \d+%）/, '标记行内联 token 与省比');
 });
 
 test('记账读失败不影响压缩（fail-open）', async () => {
@@ -448,6 +464,21 @@ test('compressList 至少保 1 条', () => {
   const out = compressList(['x'.repeat(50000), 'b'], 8000, null, 60000);
   assert.ok(out.text.startsWith('x'.repeat(1000)), '首条按单行上限截断展示');
   assert.ok(out.text.includes('共 2 条'));
+});
+
+test('estTokens 与宿主同公式（ceil 中文/1.8 + ceil 其余/4）', () => {
+  assert.equal(estTokens(''), 0);
+  assert.equal(estTokens('abcd'), 1);
+  assert.equal(estTokens('中文'), 2, 'ceil(2/1.8)=2');
+  assert.equal(estTokens('中文ab'), Math.ceil(2 / 1.8) + Math.ceil(2 / 4));
+  assert.equal(estTokens('😀a'), 1, 'emoji 不是 CJK，按 4 字符/4 计');
+});
+
+test('renderSummary token 口径（有 tok 字段走 tok，分类行同源）', () => {
+  const txt = renderSummary([{ file: 'a.json', calls: 1, before: 4096, after: 1024, tokBefore: 1000, tokAfter: 250, kinds: { shell: { calls: 1, before: 4096, after: 1024, tokBefore: 1000, tokAfter: 250 } } }]);
+  assert.match(txt, /省 ≈750 tok \/ 3\.0KB \(75\.0%\)/);
+  assert.match(txt, /原文 4\.0KB≈1\.0k tok → 压缩后 1\.0KB≈250 tok/);
+  assert.match(txt, /分类：shell 1次 ≈1\.0k→250 tok/);
 });
 
 // ---------------------------------------------------------------- report (#3)
