@@ -550,6 +550,32 @@ test('③ 兜底：谓词互斥——已知工具与自家报表工具不被兜�
 
 // ---------------------------------------------------------------- guard (#4/#5)
 
+test('② 水位数值文件：每轮 guard 开时写余量小文件（未越线也写，不发提醒）', async () => {
+  const h = harness({ env: HOME, usage: { used: 1000, size: 20000 } });
+  const res = await h.firePrompt();
+  assert.equal(res.text, '继续');
+  assert.ok(!((res.context || []).length), '5% 不越线不发提醒');
+  assert.equal(h.writes.length, 1);
+  assert.ok(h.writes[0].path.endsWith('/wb-ops/watermark/deadbeef.num'), h.writes[0].path);
+  assert.ok(h.writes[0].text.startsWith('19000'), '首行=剩余');
+});
+
+test('② 水位数值文件：越线提醒附带 Read 路径', async () => {
+  const h = harness({ env: HOME, usage: { used: 18000, size: 20000 } });
+  const res = await h.firePrompt();
+  const note = res.context[res.context.length - 1];
+  assert.match(note, /wb-ops 水位/);
+  assert.match(note, /余量速查：Read C:\/tmp-home\/\.workbuddy\/wb-ops\/watermark\/deadbeef\.num/);
+});
+
+test('② 水位数值文件：写失败 → 提醒仍在但无路径，不炸', async () => {
+  const h = harness({ env: HOME, usage: { used: 90, size: 100 }, writeFail: true });
+  const res = await h.firePrompt();
+  const note = res.context[res.context.length - 1];
+  assert.match(note, /wb-ops 水位/);
+  assert.ok(!note.includes('余量速查'), '路径未承诺');
+});
+
 test('pickWatermark 候选形状与拒判', () => {
   assert.deepEqual(pickWatermark({ used: 500, size: 1000 }), { used: 500, size: 1000 });
   assert.deepEqual(pickWatermark({ inputTokens: 900, contextWindow: 1000 }), { used: 900, size: 1000 });
