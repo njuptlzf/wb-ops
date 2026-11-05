@@ -5,7 +5,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { register, compress, compressList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, summarizeStats, renderSummary, pickWatermark, guardNote, COMPACT_RETENTION } from '../hooks/register.ts';
+import { register, compress, compressList, trimList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, summarizeStats, renderSummary, pickWatermark, guardNote, describeShape, hasLongString, toolNameOf, probeUsage, COMPACT_RETENTION } from '../hooks/register.ts';
 
 function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean; listFail?: boolean; list?: unknown[]; files?: Record<string, string>; usage?: unknown; usageFail?: boolean } = {}) {
   const writes: { path: string; text: string }[] = [];
@@ -557,9 +557,10 @@ test('② 水位数值文件：每轮 guard 开时写余量小文件（未越线
   const res = await h.firePrompt();
   assert.equal(res.text, '继续');
   assert.ok(!((res.context || []).length), '5% 不越线不发提醒');
-  assert.equal(h.writes.length, 1);
-  assert.ok(h.writes[0].path.endsWith('/wb-ops/watermark/deadbeef.num'), h.writes[0].path);
-  assert.ok(h.writes[0].text.startsWith('19000'), '首行=剩余');
+  const wm = h.writes.find((w) => w.path.endsWith('/wb-ops/watermark/deadbeef.num'));
+  assert.ok(wm, '水位文件已写');
+  assert.ok(wm.text.startsWith('19000'), '首行=剩余');
+  assert.ok(h.writes.some((w) => w.path.includes('/wb-ops/debug/usage-')), 'usage 形状诊断也落盘');
 });
 
 test('② 水位数值文件：越线提醒附带 Read 路径', async () => {
@@ -726,4 +727,128 @@ test('report.mjs CLI：真实目录聚合', async () => {
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+// ------------------------------------------- v0.11：宿主形状适配（Grep 原生数组）+ 诊断通道 + 预算
+
+test('Grep 原生数组：content 是 string[] → 裁条目 + 单行说明，保持数组形态', async () => {
+  const h = harness({ env: HOME });
+  const items = Array.from({ length: 400 }, (_, i) => `C://repo//src//file${i}.ts:${i}: const value = ${'y'.repeat(80)}`);
+  const { out } = await h.call('Grep', { title: 'Found 400 files', content: items });
+  const res = (out as any).result;
+  assert.ok(Array.isArray(res.content), '回写仍是数组（宿主按数组渲染/序列化）');
+  assert.ok(res.content.length < items.length, '条目被裁');
+  assert.ok(res.content.length >= 2, '至少保留 1 条 + 说明');
+  const note = res.content[res.content.length - 1];
+  assert.match(note, /\[wb-ops\] 共 400 条，已省略 \d+ 条/);
+  assert.ok(h.writes.some((w) => w.path.endsWith('.json')), '原文落盘 .json');
+});
+
+test('Grep 原生数组：预算内 → 零影响透传（不裁不改）', async () => {
+  const h = harness({ env: HOME });
+  const items = ['C://a.ts', 'C://b.ts'];
+  const { out } = await h.call('Grep', { title: 'Found 2 files', content: items });
+  assert.deepEqual((out as any).result.content, items);
+  assert.equal(h.writes.length, 0, '预算内零 IO');
+});
+
+test('extractText：content 为纯字符串数组 → 返回 items/isArray，raw 是其 JSON 形态', () => {
+  const t = extractText({ title: 'Found 2 files', content: ['C://a.ts', 'C://b.ts'] });
+  assert.ok(t);
+  assert.deepEqual(t!.items, ['C://a.ts', 'C://b.ts']);
+  assert.equal(t!.isArray, true);
+  assert.deepEqual(JSON.parse(t!.raw), ['C://a.ts', 'C://b.ts']);
+});
+
+test('extractText：混合类型数组 → 仍判不出（fail-open 不变）', () => {
+  assert.equal(extractText({ content: ['a.ts', { path: 'b.ts' }] }), null);
+});
+
+test('trimList：按字节预算裁条目 + 单行说明（无换行，宿主 JSON 序列化不炸）', () => {
+  const items = Array.from({ length: 100 }, (_, i) => `path${i}-${'z'.repeat(50)}`);
+  const { kept, note, dropped } = trimList(items, 4500, 'C:/spill/x.json', 12345);
+  assert.ok(kept.length < items.length);
+  assert.ok(kept.length >= 1);
+  assert.equal(dropped, items.length - kept.length);
+  assert.ok(!note.includes('\n'), '说明是单行');
+  assert.match(note, /共 100 条，已省略 \d+ 条/);
+  assert.ok(note.includes('C:/spill/x.json'));
+});
+
+test('默认预算下调到 4500：3KB 透传、6KB 压缩（宿主落盘阈值 ~8KB 之下留余量）', async () => {
+  const h = harness({ env: HOME });
+  const small = 'Command: x\n' + 'a'.repeat(2000) + '\nExit Code: 0';
+  const { r: r1 } = await h.bash(small);
+  assert.equal(r1.result, small, '预算内透传');
+  const big = 'Command: x\n' + 'a'.repeat(6000) + '\nExit Code: 0';
+  const { out: o2 } = await h.bash(big);
+  assert.ok(String((o2 as any).result).includes('[wb-ops]'), '超 4500 即压缩');
+});
+
+test('形状诊断：describeShape 只出键名/类型/长度，绝不吐正文', () => {
+  const secret = 'SECRET-PAYLOAD-9f3a';
+  const s = describeShape({ content: [{ path: secret }], meta: { n: 3 }, flag: true });
+  const text = JSON.stringify(s);
+  assert.ok(text.includes('content') && text.includes('meta'), '键名在');
+  assert.ok(!text.includes(secret), '正文不落盘');
+  assert.ok(text.includes('"n"'), '嵌套键名在');
+});
+
+test('形状诊断：hasLongString 能识别大字符串与大字符串数组', () => {
+  assert.equal(hasLongString(describeShape({ a: 'x'.repeat(5000) }), 4500), true);
+  assert.equal(hasLongString(describeShape({ a: 'x'.repeat(100) }), 4500), false);
+  assert.equal(hasLongString(describeShape({ a: Array.from({ length: 100 }, () => 'y'.repeat(100)) }), 4500), true);
+  assert.equal(hasLongString(describeShape({ a: ['y'] }), 4500), false);
+});
+
+test('形状诊断：判不出形状且内容大 → 落盘 debug（只记结构）；内容小 → 不落盘', async () => {
+  const h = harness({ env: HOME });
+  const big = { payload: { body: 'z'.repeat(9000) } };      // 字段名不认识 + 内容大
+  await h.callUnknown('McpX', big);
+  const dbg = h.writes.find((w) => w.path.includes('/wb-ops/debug/shape-'));
+  assert.ok(dbg, '形状诊断落盘');
+  assert.ok(dbg.text.includes('payload'), '记键名');
+  assert.ok(!dbg.text.includes('zzzz'), '不记正文');
+  const h2 = harness({ env: HOME });
+  await h2.callUnknown('McpY', { payload: { body: 'z'.repeat(100) } });
+  assert.ok(!h2.writes.some((w) => w.path.includes('/wb-ops/debug/')), '小输出不打扰');
+});
+
+test('toolNameOf：多候选取第一个字符串', () => {
+  assert.equal(toolNameOf({ tool: 'Bash' }), 'Bash');
+  assert.equal(toolNameOf({ toolName: 'Grep' }), 'Grep');
+  assert.equal(toolNameOf({}), '?');
+});
+
+test('usage 探测：函数不存在 → err 记述、不炸', async () => {
+  const p = await probeUsage({ session: {} });
+  assert.match(String(p.err), /not a function/);
+  assert.equal(p.shape, undefined);
+});
+
+test('usage 探测：抛错 → err 记述、不炸', async () => {
+  const p = await probeUsage({ session: { usage: async () => { throw new Error('usage unavailable'); } } });
+  assert.match(String(p.err), /usage unavailable/);
+});
+
+test('usage 探测：deny 形态被识别（宿主未接线该能力）', async () => {
+  const p = await probeUsage({ session: { usage: async () => ({ deny: '$.session.usage is unavailable: the host did not wire this capability' }) } });
+  assert.match(String(p.deny), /not wire this capability/);
+  assert.ok(p.shape);
+});
+
+test('usage 探测：值形状被记录（{value:…} 包装看得见）', async () => {
+  const p = await probeUsage({ session: { usage: async () => ({ value: { used: 100, size: 200 } }) } });
+  const text = JSON.stringify(p.shape);
+  assert.ok(text.includes('value'), '包装层键名在');
+  assert.ok(text.includes('used') && text.includes('size'), '内层键名在');
+});
+
+test('usage 探测：形状未变不重复落盘（热路径纪律）', async () => {
+  const h = harness({ env: HOME, usage: { used: 1000, size: 20000 } });
+  await h.firePrompt();
+  const first = h.writes.filter((w) => w.path.includes('/wb-ops/debug/usage-')).length;
+  await h.firePrompt();
+  const second = h.writes.filter((w) => w.path.includes('/wb-ops/debug/usage-')).length;
+  assert.equal(first, second, '形状没变不重复写');
 });
