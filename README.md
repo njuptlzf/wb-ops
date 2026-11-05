@@ -74,7 +74,26 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" --
 
 加载成功时输出 `mods: loaded mod "wb-ops" from .codebuddy-plugin (tier user, hooks: tool.call)`。
 
-**GUI**：跑一次 `node scripts/install-gui.mjs` —— 按宿主给其他插件写下的真实落盘格式（本机对照 sana wb-ops 的 `local@` 记录）登记 `wb-ops-local` directory 市场、复制 payload 到 `marketplaces/` 与 `cache/wb-ops-local/wb-ops/<version>/`、写入 `installed_plugins.json` v2 条目；合并不覆盖既有市场，卸载 `node scripts/install-gui.mjs --uninstall` 只摘自己（离线单测在临时 HOME 钉死这些形状）。之后**重启 GUI 在插件管理里确认启用——这一记人工点击尚未在本机验证**。注意：与 sana 的 `wb-ops` 插件名相同，若两者都要装，用不同 marketplace 名或只走 `--plugin-dir`，避免插件缓存键冲突。
+**GUI**：跑一次 `node scripts/install-gui.mjs`——写三处，缺一不可（宿主运行时投影 = `enabledPlugins` + `installed_plugins.json` + `cache/<mkt>/<plugin>/<version>`，见官方《插件市场》文档）：
+
+| 落点 | 内容 | 缺了会怎样 |
+|---|---|---|
+| `plugins/marketplaces/wb-ops-local/.codebuddy-plugin/marketplace.json` | 市场清单（`plugins[0].source="./wb-ops"`） | 宿主列不出该市场，`/plugin` 的「市场」页里没有它 |
+| `plugins/installed_plugins.json` → `wb-ops@wb-ops-local` | 安装记录（指向 cache 快照） | 不在「已安装」列表里 |
+| `settings.json` → `enabledPlugins["wb-ops@wb-ops-local"]=true` | 期望启用态 | `status=disabled`，mod 永不加载（这一条最容易被漏） |
+
+同时复制 payload 到 `marketplaces/` 与 `cache/wb-ops-local/wb-ops/<version>/`；合并不覆盖既有市场与别人的 `enabledPlugins` 声明，卸载 `node scripts/install-gui.mjs --uninstall` 只摘自己（离线单测在临时 HOME 钉死这些形状）。
+
+**生效方式**：mod 的中间件在**运行时启动时**引导（`bootstrapFunctionHookMods`），`/reload-plugins` 不会重新引导——所以**新开一个对话/新起一个会话**即可生效；想要本会话立刻生效就重启 WorkBuddy。命令行侧等价操作：`/plugin`（发现/已安装/市场/错误四页）、`/plugin marketplace add`、`/plugin install wb-ops@wb-ops-local`、`/plugin enable`。
+
+**自检**（宿主自带校验器）：
+
+```bash
+node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" plugin validate C:/Users/dev/work/wb-ops
+node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" plugin list   # 应见 wb-ops@wb-ops-local  Status: enabled
+```
+
+注意：与 sana 的 `wb-ops` 插件名相同，若两者都要装，用不同 marketplace 名或只走 `--plugin-dir`，避免插件缓存键冲突。
 
 ## 配置（环境变量，经 `$.env.get` 读取）
 
@@ -113,3 +132,22 @@ node --test test/register.test.ts   # 63 项，全绿（需 Node ≥22.6 的 --e
   ```
   结果里出现 `[wb-ops]` 标记即闭环；Read/源码用例输出**必须**无标记。
 - ⚠️ GUI 注册表写入格式对照本机宿主自写文件（sana `local@` 记录）复刻，install-gui.mjs 有离线装/卸单测，但 **GUI 重启后的插件列表识别与启用点击**未验证。
+
+## 2026-11-05 真机安装闭环（官方《插件市场》文档校对）
+
+宿主加载一个 mod 需要三处同时成立（`enabledPlugins` + `installed_plugins.json` + `cache` 快照），**只登记 installed 条目是不够的**——`getInstalledPluginsForWorkspaceState` 的候选集直接来自 `enabledPlugins` 映射，缺它则 `status=disabled`，插件连「已安装」列表都进不去，mod 永不加载。这条是原 `install-gui.mjs` 的漏项，已补：
+
+| 落点 | 状态 |
+|---|---|
+| `marketplaces/wb-ops-local/.codebuddy-plugin/marketplace.json` | ✅ 已补（官方要求：市场根目录必须有） |
+| `installed_plugins.json` → `wb-ops@wb-ops-local` | ✅ 原有 |
+| `settings.json` → `enabledPlugins["wb-ops@wb-ops-local"]=true` | ✅ 已补（原漏项） |
+
+本机真机验证（`CODEBUDDY_CONFIG_DIR` 指到 `~/.workbuddy`）：
+
+- `plugin validate` 对插件清单与市场清单**双双 ✔ Validation passed**；
+- `plugin list` → `wb-ops@wb-ops-local / 0.10.0 / user / Status: enabled`；
+- 宿主打印 `mods: loaded mod "wb-ops" from .codebuddy-plugin (tier user, hooks: tool.call session.start prompt.submit session.compact)`——**走市场安装路径加载**（不带 `--plugin-dir`）；
+- 会话日志 `~/.workbuddy/logs/<date>/<cwd>__<sid>.log` 里可见该行：mod 在**新起的运行时**（新 pid）里生效，老运行时（启用前启动的）不加载 → 启用后要**新开对话**才生效，`/reload-plugins` 不重新引导 mod（`bootstrapFunctionHookMods` 只在启动时调用且被记忆化）。
+
+其余待验证项（①②③④）待新会话里跑：宿主 Bash 大输出会先被自家 `<persisted-output>` 落盘（121KB），mod 的 `tool.call` 中间件看到的是压缩前还是压缩后的结果，需实测确认。

@@ -586,7 +586,7 @@ test('② 记账未开启 → 水位文件仍写（跟 guard 走），但不产�
   assert.ok(!((res.context || []).length), '5% 不越线不发提醒');
 });
 
-test('④ install-gui.mjs：临时 HOME 装+卸，known/installed 形状正确', async () => {
+test('④ install-gui.mjs：临时 HOME 装+卸，known/installed/marketplace.json/enabledPlugins 形状正确', async () => {
   const { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, mkdirSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -597,6 +597,8 @@ test('④ install-gui.mjs：临时 HOME 装+卸，known/installed 形状正确',
     const pluginsDir = join(home, '.workbuddy', 'plugins');
     mkdirSync(pluginsDir, { recursive: true });
     writeFileSync(join(pluginsDir, 'known_marketplaces.json'), JSON.stringify({ other: { manifestName: 'other', type: 'directory', source: { source: 'directory', path: 'X:\\keep' }, installLocation: 'X:\\keep', autoUpdate: true } }, null, 2));
+    // 预置 settings.json（含别的 enabledPlugins 键），验证合并不丢别人的声明
+    writeFileSync(join(home, '.workbuddy', 'settings.json'), JSON.stringify({ enabledPlugins: { 'other@workbuddy-builtin': true }, sandbox: { x: 1 } }, null, 2));
     const script = join(import.meta.dirname!, '..', 'scripts', 'install-gui.mjs');
     const r1 = spawnSync(process.execPath, [script], { env: { ...process.env, WB_OPS_INSTALL_HOME: home.replace(/\\/g, '/') } });
     assert.equal(r1.status, 0, r1.stderr?.toString());
@@ -609,12 +611,28 @@ test('④ install-gui.mjs：临时 HOME 装+卸，known/installed 形状正确',
     assert.ok(entry.version && /^\d+\.\d+\.\d+/.test(entry.version), entry.version);
     assert.ok(existsSync(join(entry.installPath.replace(/\\\\/g, '\\'), 'hooks', 'register.ts')), 'cache 里有 payload');
     assert.ok(existsSync(join(pluginsDir, 'marketplaces', 'wb-ops-local', 'wb-ops', '.codebuddy-plugin', 'plugin.json')), 'marketplaces 目录结构');
+    // 市场清单：市场根目录 .codebuddy-plugin/marketplace.json（官方规范，宿主据此枚举市场）
+    const mkManifestPath = join(pluginsDir, 'marketplaces', 'wb-ops-local', '.codebuddy-plugin', 'marketplace.json');
+    assert.ok(existsSync(mkManifestPath), '市场清单存在');
+    const mk = JSON.parse(readFileSync(mkManifestPath, 'utf8'));
+    assert.equal(mk.name, 'wb-ops-local');
+    assert.ok(Array.isArray(mk.plugins) && mk.plugins[0].name === 'wb-ops', '市场清单列出 wb-ops');
+    assert.equal(mk.plugins[0].source, './wb-ops', 'source 为相对市场根的路径');
+    // 启用声明：settings.json 的 enabledPlugins（缺它宿主 status=disabled，mod 不加载）
+    const st1 = JSON.parse(readFileSync(join(home, '.workbuddy', 'settings.json'), 'utf8'));
+    assert.equal(st1.enabledPlugins['wb-ops@wb-ops-local'], true, 'enabledPlugins 声明为 true');
+    assert.equal(st1.enabledPlugins['other@workbuddy-builtin'], true, '既有 enabledPlugins 保留');
+    assert.deepEqual(st1.sandbox, { x: 1 }, 'settings 其他键保留');
     const r2 = spawnSync(process.execPath, [script, '--uninstall'], { env: { ...process.env, WB_OPS_INSTALL_HOME: home.replace(/\\/g, '/') } });
     assert.equal(r2.status, 0, r2.stderr?.toString());
     const known2 = JSON.parse(readFileSync(join(pluginsDir, 'known_marketplaces.json'), 'utf8'));
     assert.ok(known2.other && !known2['wb-ops-local'], '卸载只摘自己');
     const inst2 = JSON.parse(readFileSync(join(pluginsDir, 'installed_plugins.json'), 'utf8'));
     assert.ok(!inst2.plugins['wb-ops@wb-ops-local']);
+    assert.ok(!existsSync(join(pluginsDir, 'marketplaces', 'wb-ops-local')), '卸载摘掉市场目录');
+    const st2 = JSON.parse(readFileSync(join(home, '.workbuddy', 'settings.json'), 'utf8'));
+    assert.ok(!('wb-ops@wb-ops-local' in (st2.enabledPlugins || {})), '卸载撤销 enabledPlugins 声明');
+    assert.equal(st2.enabledPlugins['other@workbuddy-builtin'], true, '卸载不动别人的声明');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
