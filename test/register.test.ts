@@ -62,13 +62,21 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
     const hk = hooks.find((k) => k.ev === 'session.start');
     return hk ? hk.h($, {}, async (e: any) => ({ passed: e })) : null;
   };
+  const fnHooks = (toolName: string) =>
+    hooks.filter((k) => k.ev === 'tool.call' && typeof k.matcher.tool === 'function' && k.matcher.tool(toolName));
   const callReport = async () => {
-    const hk = hooks.find((k) => k.ev === 'tool.call' && typeof k.matcher.tool === 'function');
-    if (!hk) throw new Error('report handler not registered');
     const name = 'mcp__wb_ops__report';
-    if (!hk.matcher.tool(name)) return { skipped: true as const };
-    const out = await hk.h($, { tool: name }, async () => { throw new Error('next must not run for own tool'); });
+    const hks = fnHooks(name);
+    if (hks.length !== 1) throw new Error(`report predicate should match own tool exactly once, got ${hks.length}`);
+    const out = await hks[0].h($, { tool: name }, async () => { throw new Error('next must not run for own tool'); });
     return { skipped: false as const, out };
+  };
+  const callUnknown = async (toolName: string, result: unknown, event: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) => {
+    const hks = fnHooks(toolName);
+    if (hks.length !== 1) throw new Error(`fallback predicate should match unknown tool exactly once, got ${hks.length}`);
+    const r = { result, ...extra };
+    const out = await hks[0].h($, { tool: toolName, callId: 'cf1', ...event }, async () => r);
+    return { r, out };
   };
   const call = async (tool: string, result: unknown, event: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) => {
     const r = { result, ...extra };
@@ -77,7 +85,7 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
   };
   const bash = (result: unknown, event: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) =>
     call('Bash', result, { input: { command: 'npm test' }, ...event }, extra);
-  return { $, writes, reads, call, bash, byTool, regCalls, fireSessionStart, callReport, firePrompt, fireCompact, usageCalls };
+  return { $, writes, reads, call, bash, byTool, regCalls, fireSessionStart, callReport, callUnknown, fnHooks, firePrompt, fireCompact, usageCalls };
 }
 
 const HOME = { USERPROFILE: 'C:/tmp-home' };
@@ -469,8 +477,8 @@ test('report 工具：读目录聚合渲染（谓词命中、next 不可达）',
     list: ['aaaa1111.json', 'bad.json', 'notes.txt'],
     files: { [`${dir}/aaaa1111.json`]: JSON.stringify({ calls: 3, before: 30000, after: 5000, tool: 'jsonlist', ts: '2026-11-04T09:00:00.000Z' }) },
   });
-  const { skipped, out } = await h.callReport();
-  assert.equal(skipped, false);
+  await h.fireSessionStart(); // 注册 report → 谓词命中自己、兜底排除
+  const { out } = await h.callReport();
   assert.ok(out.result.includes('压缩 3 次'));
   assert.ok(out.result.includes('jsonlist'), '最后 tool 字段透出');
   assert.ok(!out.result.includes('bad'), '坏 JSON 行被跳过');
@@ -478,14 +486,66 @@ test('report 工具：读目录聚合渲染（谓词命中、next 不可达）',
 
 test('report 工具：fs.list 抛错 → 空账本文案（fail-open）', async () => {
   const h = harness({ env: { ...HOME, WB_OPS_STATS: '1' }, listFail: true });
+  await h.fireSessionStart();
   const { out } = await h.callReport();
   assert.match(out.result, /还没有记账数据/);
 });
 
 test('report 工具：stats 未开 → 提示文案', async () => {
+  const reg = harness({ env: { ...HOME, WB_OPS_STATS: '1' } });
+  await reg.fireSessionStart(); // 本会话注册过（设置 reportToolName），随后 stats 关掉 → 防御分支
   const h = harness({ env: HOME });
   const { out } = await h.callReport();
   assert.match(out.result, /报表未启用/);
+});
+
+// ---------------------------------------------------------------- fallback (③)
+
+const bigMcp = () => Array.from({ length: 3000 }, (_, i) => `row ${i} payload ${'x'.repeat(30)}`).join('\n');
+
+test('③ 兜底：未知工具超预算 → 压缩+落盘+标记', async () => {
+  const h = harness({ env: HOME });
+  const body = bigMcp();
+  const { out } = await h.callUnknown('mcp__notion__search', body);
+  const txt = out.result as string;
+  assert.notEqual(out, undefined);
+  assert.equal(h.writes.length, 1, '落盘一次');
+  assert.ok(h.writes[0].path.includes('/wb-ops/spill/deadbeef/'), h.writes[0].path);
+  assert.ok(h.writes[0].text === body, '原文完整');
+  assert.ok(txt.includes('[wb-ops]'), '有标记');
+  assert.ok(txt.includes('row 0 payload'), '头部保留');
+  assert.ok(byteLen(txt) <= 8000 + 1400, `预算内: ${byteLen(txt)}`);
+});
+
+test('③ 兜底：预算内原样透传（Edit/小结果零影响）', async () => {
+  const h = harness({ env: HOME });
+  const { r, out } = await h.callUnknown('mcp__small__tool', 'tiny output');
+  assert.equal(out, r, '必须是原对象');
+  assert.equal(h.writes.length, 0);
+});
+
+test('③ 兜底：非零 Exit Code → 完整透传不提示', async () => {
+  const h = harness({ env: HOME });
+  const body = bigMcp() + '\nExit Code: 3';
+  const { r, out } = await h.callUnknown('mcp__runner__exec', body);
+  assert.equal(out, r, '失败现场保持原样');
+  assert.equal(h.writes.length, 0);
+});
+
+test('③ 兜底：WB_OPS_FALLBACK=0 → 未知工具透传，白名单不受影响', async () => {
+  const h = harness({ env: { ...HOME, WB_OPS_FALLBACK: '0' } });
+  const { r, out } = await h.callUnknown('mcp__anything', bigMcp());
+  assert.equal(out, r);
+  assert.equal(h.writes.length, 0);
+  const b = await h.bash(bigMcp());
+  assert.ok((b.out.result as string).includes('[wb-ops]'), '白名单照常压缩');
+});
+
+test('③ 兜底：谓词互斥——已知工具与自家报表工具不被兜底双命中', async () => {
+  const reg = harness({ env: { ...HOME, WB_OPS_STATS: '1' } });
+  await reg.fireSessionStart();
+  assert.equal(reg.fnHooks('Bash').length, 0, 'Bash 只走字面 matcher');
+  assert.equal(reg.fnHooks('mcp__wb_ops__report').length, 1, 'report 名只命中自家 handler');
 });
 
 // ---------------------------------------------------------------- guard (#4/#5)

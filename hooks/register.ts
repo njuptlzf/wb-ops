@@ -71,12 +71,13 @@ export function classifyRead(path: string): ReadGate {
   return READ_SOURCE;
 }
 
-/** 工具 → 策略。匹配器逐工具注册（mods 文档只验证过 {tool:'X'} 字面匹配，不赌正则）。 */
+/** 工具 → 策略。前 8 个按文档验证过的字面 matcher 注册；其余工具名走末尾谓词 matcher（③ 兜底）。 */
 const POLICY: Record<string, string> = {
   Bash: 'shell', PowerShell: 'shell', TaskOutput: 'shell',
   Grep: 'jsonlist', Glob: 'jsonlist',
   Read: 'read', WebFetch: 'doc', WebSearch: 'doc',
 };
+const KNOWN_TOOLS = new Set(Object.keys(POLICY));
 
 /**
  * 错误现场 nextAction 提示（dsh-ops 原则④「遏制报错重试循环」：一行可执行的下一步，
@@ -101,7 +102,7 @@ export function hintFor(raw: string): string | null {
   return null;
 }
 
-interface Cfg { enabled: boolean; budget: number; deadlineMs: number; home: string; stats: boolean; hints: boolean; guard: boolean; guardPct: number; }
+interface Cfg { enabled: boolean; budget: number; deadlineMs: number; home: string; stats: boolean; hints: boolean; guard: boolean; guardPct: number; fallback: boolean; }
 type Sink = { put: (s: string) => unknown };
 export interface Compression { text: string; dropped: number; }
 
@@ -383,6 +384,7 @@ async function readCfg($: any): Promise<Cfg> {
     hints: !/^(0|off|false|no)$/i.test((await g('WB_OPS_HINTS')).trim()),
     guard: !/^(0|off|false|no)$/i.test((await g('WB_OPS_GUARD')).trim()),
     guardPct: gpct > 0 && gpct < 100 ? gpct : DEFAULT_GUARD_PCT,
+    fallback: !/^(0|off|false|no)$/i.test((await g('WB_OPS_FALLBACK')).trim()),
   };
 }
 
@@ -519,18 +521,19 @@ function makeHandler(kind: string) {
       if (!cfgP) cfgP = readCfg($);
       const cfg = await cfgP;
       if (!cfg.enabled) return r;
+      if (kind === 'other' && !cfg.fallback) return r; // ③ 兜底单独开关：WB_OPS_FALLBACK=0
       const t = extractText(r.result);
       if (!t) return r;
       const len = t.raw.length;
 
-      // shell 类：Exit Code 非零 → 现场完整透传（不压缩、不落盘），至多加一行 nextAction 提示。
+      // shell 类（含 ③ 兜底的未知工具——MCP bash 包装同样遵守 Exit Code 尾标）：非零 → 现场完整透传。
       // 特意放在预算/大小早退之前：失败输出多半不大，而"盲目重跑一整轮"恰恰发生在这些小现场上。
-      if (kind === 'shell') {
+      if (kind === 'shell' || kind === 'other') {
         const codes = t.raw.slice(-2000).match(/Exit Code:\s*(-?\d+)/gi);
         if (codes && codes.length) {
           const last = parseInt(codes[codes.length - 1].replace(/.*?:\s*/, ''), 10);
           if (Number.isFinite(last) && last !== 0) {
-            if (!cfg.hints || len > MAX_INPUT_BYTES || alreadyMarked(t.raw)) return r;
+            if (kind !== 'shell' || !cfg.hints || len > MAX_INPUT_BYTES || alreadyMarked(t.raw)) return r;
             const h = hintFor(t.raw);
             return h ? { ...r, result: t.sink.put(t.raw + '\n' + HINT_PREFIX + h) } : r;
           }
@@ -583,6 +586,10 @@ export function register(on: On, _options?: unknown): void {
   for (const tool of Object.keys(POLICY)) {
     on('tool.call', { tool }, makeHandler(POLICY[tool]));
   }
+  // ③ 通配兜底：所有未列策略的工具（MCP 工具、宿主新增工具）过同一套通用压缩。
+  // 谓词每次事件重评（文档 mods.txt「深匹配」节），故排除自身报表工具用模块变量即可。
+  // 预算内的输出本来就原样透传——兜底只碰真正超线的，Edit/Write 这类小结果零影响。
+  on('tool.call', { tool: (v: unknown) => typeof v === 'string' && !KNOWN_TOOLS.has(v) && v !== reportToolName }, makeHandler('other'));
 
   // #3 报表：仅当用户开了 WB_OPS_STATS 才注册工具——不记账时不往提示词里塞 schema（token 经济自洽）
   on('session.start', async ($: any, e: any, next: any) => {
