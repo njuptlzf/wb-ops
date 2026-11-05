@@ -67,10 +67,28 @@ WorkBuddy 的**上下文治理 Mod**（Mod-first）：进程内 `tool.call` 中�
 
 ## 安装
 
+### 方式一：跟 AI 说一句话（推荐）
+
+把下面这句直接发给 WorkBuddy 对话里的 AI，剩下的它来做（克隆 → 安装 → 校验 → 告知生效方式）：
+
+> 帮我安装 wb-ops 插件：克隆 https://github.com/njuptlzf/wb-ops 到 ~/work/wb-ops，然后运行 `node scripts/install-gui.mjs` 完成安装，再用 `plugin list` 确认 `wb-ops@wb-ops-local` 显示 enabled，最后告诉我怎么让它生效。
+
+AI 会执行三步：`git clone` → `node scripts/install-gui.mjs`（写齐宿主加载必需的三处：市场清单 + installed_plugins + `enabledPlugins`，缺一不可）→ `plugin list` 自检。装完**新开一个对话**即生效（mod 在运行时启动时引导，`/reload-plugins` 不会重新引导）。
+
+已装好想升级？同一句话换成：
+
+> wb-ops 出新版了：在 ~/work/wb-ops 里 `git pull` 后重新运行 `node scripts/install-gui.mjs`，确认 plugin list 版本号已更新。
+
+不想要了：
+
+> 卸载 wb-ops 插件：运行 `node scripts/install-gui.mjs --uninstall`（只摘它自己，不动其他插件）。
+
+### 方式二：命令行（手动）
+
 **CLI**（已验证加载）：
 
 ```bash
-node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" --plugin-dir C:/Users/dev/work/wb-ops
+node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" --plugin-dir <wb-ops 目录>
 ```
 
 加载成功时输出 `mods: loaded mod "wb-ops" from .codebuddy-plugin (tier user, hooks: tool.call)`。
@@ -95,6 +113,20 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" pl
 ```
 
 注意：与 sana 的 `wb-ops` 插件名相同，若两者都要装，用不同 marketplace 名或只走 `--plugin-dir`，避免插件缓存键冲突。
+
+## 验证：跟 AI 说一句话
+
+装完**新开一个对话**，把这句发给 AI（分层检查：加载态 → 压缩实测 → 诊断落盘）：
+
+> 验证 wb-ops 插件是否正常工作：① 运行 `plugin list` 确认 wb-ops@wb-ops-local 是 enabled；② 执行 `seq -f "row-%04g" 1 1200`（约 11KB 输出，落在 4500B~宿主阈值的压缩区间），检查输出是否出现 `[wb-ops]` 压缩标记和 `落盘` 回查路径；③ 列出 `~/.workbuddy/wb-ops/debug/` 和 `~/.workbuddy/wb-ops/watermark/` 下的文件，报告 fsprobe 的 ok/err 与水位数据源；④ 把结论汇总给我。
+
+预期结果：② 输出被压缩成 头+关键行+尾 并附 `原文 NNKB → 落盘 …/spill/<sid8>/N-*.txt`；③ `fsprobe-<sid8>.json` 为 ok（或 ENOENT——文件不存在不是权限问题），`watermark/<sid8>.num` 存在且首行是剩余 token 数。
+
+只想快速看压缩是否生效，一句话就够：
+
+> 运行 `seq -f "row-%04g" 1 1200`，告诉我输出里有没有 `[wb-ops]` 标记和落盘路径。
+
+想知道**为什么信得过这个插件**（验证流程、原始数据、复现命令），见 [VERIFICATION.md](VERIFICATION.md)——v0.12.0 三项验收与 v0.12.1 大文件降级的全部真机证据都在里面，包括两条可复用的宿主验证通道（settings.json env 注入、CLI 固定 sid + 预置 transcript）。
 
 ## 配置（环境变量，经 `$.env.get` 读取）
 
@@ -128,7 +160,10 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" pl
 
 ```bash
 node --test test/register.test.ts   # 91 项，全绿（需 Node ≥22.6 的 --experimental-strip-types，或 Node 23+ 直接跑）
+bash test/run-acceptance.sh <合法UUID> "验收" WB_OPS_GUARD_PCT=10   # 真机验收触发器（无需登录，见脚本头注释）
 ```
+
+验收的完整流程、原始数据与结论见 [VERIFICATION.md](VERIFICATION.md)。
 
 沙箱纪律：mods 内禁止 `node:require/process/global`（引擎会当场拒绝整个 mod），`register.ts` 唯一的 import 是 `codebuddy-code` 的**纯类型**导入，运行时被擦除。所有宿主能力走 `$`：`$.env` / `$.fs.write` / `$.session.id()`。
 
