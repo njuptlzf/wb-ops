@@ -2,7 +2,7 @@
 
 WorkBuddy 的**上下文治理 Mod**（Mod-first）：进程内 `tool.call` 中间件，在工具结果进入模型上下文之前做确定性压缩，原文落盘可回查。错误输出**永不压缩**。目标只有一个：**降本增效——让进入上下文的每一份 token 都携带高价值信息**。
 
-当前版本 v0.9 覆盖 **8 个高频出口 + 通配兜底**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（JSON 数组识别）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）；开启记账后提供省量报表（会话内 `mcp__wb_ops__report` 工具 + 沙箱外 `node hooks/report.mjs`，按工具类型细分 分类 行）；上下文水位守卫（prompt.submit ≥85% 一行提醒）与压缩保留指示（session.compact instructions，Mod 版 PreCompact）；POLICY 之外的所有工具名（MCP、宿主新增）由谓词 matcher 兜底走通用压缩。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
+当前版本 v0.10 覆盖 **8 个高频出口 + 通配兜底**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（JSON 数组识别）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）；开启记账后提供省量报表（会话内 `mcp__wb_ops__report` 工具 + 沙箱外 `node hooks/report.mjs`，按工具类型细分 分类 行）；上下文水位守卫（prompt.submit ≥85% 一行提醒）与压缩保留指示（session.compact instructions，Mod 版 PreCompact）；POLICY 之外的所有工具名（MCP、宿主新增）由谓词 matcher 兜底走通用压缩。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
 
 | 工具 | 策略 |
 |---|---|
@@ -74,7 +74,7 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" --
 
 加载成功时输出 `mods: loaded mod "wb-ops" from .codebuddy-plugin (tier user, hooks: tool.call)`。
 
-**GUI**：登记为本地 marketplace（`~/.workbuddy/plugins/known_marketplaces.json` 加 `{ "type": "directory", "path": ... }`）后安装——按 CodeBuddy 插件规范写的，GUI 装载**尚未在本机验证**。注意：与 sana 的 `wb-ops` 插件名相同，若两者都要装，用不同 marketplace 名或只走 `--plugin-dir`，避免插件缓存键冲突。
+**GUI**：跑一次 `node scripts/install-gui.mjs` —— 按宿主给其他插件写下的真实落盘格式（本机对照 sana wb-ops 的 `local@` 记录）登记 `wb-ops-local` directory 市场、复制 payload 到 `marketplaces/` 与 `cache/wb-ops-local/wb-ops/<version>/`、写入 `installed_plugins.json` v2 条目；合并不覆盖既有市场，卸载 `node scripts/install-gui.mjs --uninstall` 只摘自己（离线单测在临时 HOME 钉死这些形状）。之后**重启 GUI 在插件管理里确认启用——这一记人工点击尚未在本机验证**。注意：与 sana 的 `wb-ops` 插件名相同，若两者都要装，用不同 marketplace 名或只走 `--plugin-dir`，避免插件缓存键冲突。
 
 ## 配置（环境变量，经 `$.env.get` 读取）
 
@@ -92,7 +92,7 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" --
 ## 开发 / 测试
 
 ```bash
-node --test test/register.test.ts   # 61 项，全绿（需 Node ≥22.6 的 --experimental-strip-types，或 Node 23+ 直接跑）
+node --test test/register.test.ts   # 63 项，全绿（需 Node ≥22.6 的 --experimental-strip-types，或 Node 23+ 直接跑）
 ```
 
 沙箱纪律：mods 内禁止 `node:require/process/global`（引擎会当场拒绝整个 mod），`register.ts` 唯一的 import 是 `codebuddy-code` 的**纯类型**导入，运行时被擦除。所有宿主能力走 `$`：`$.env` / `$.fs.write` / `$.session.id()`。
@@ -100,7 +100,7 @@ node --test test/register.test.ts   # 61 项，全绿（需 Node ≥22.6 的 --e
 ## 已验证 / 未验证
 
 - ⚠️ **③ 通配兜底的谓词 matcher**：文档「深匹配」节声明支持函数谓词、每次事件重评；离线单测钉死互斥逻辑，宿主实际路由需 /login 后用一个 MCP 工具大输出看是否带标记。
-- ✅ mods 加载（CLI 启动日志 `hooks: tool.call session.start prompt.submit session.compact` 四通道全注册）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复）、报表聚合与渲染（谓词 matcher、坏文件跳过、list 抛错兜底、CLI 真目录聚合）、水位守卫与压缩保留指示（形状候选/阈值边界/关闭零触碰/fail-open）、③ 通配兜底（预算内零影响/非零透传/可关/谓词互斥）、① by-kind 分类账本（kinds 写入/聚合/渲染、无 kinds 老账本兼容）、② 水位数值文件（每轮小写/越线附带 Read 路径/写失败静默）——离线 mock API 单测 61 项
+- ✅ mods 加载（CLI 启动日志 `hooks: tool.call session.start prompt.submit session.compact` 四通道全注册）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复）、报表聚合与渲染（谓词 matcher、坏文件跳过、list 抛错兜底、CLI 真目录聚合）、水位守卫与压缩保留指示（形状候选/阈值边界/关闭零触碰/fail-open）、③ 通配兜底（预算内零影响/非零透传/可关/谓词互斥）、① by-kind 分类账本（kinds 写入/聚合/渲染、无 kinds 老账本兼容）、② 水位数值文件（每轮小写/越线附带 Read 路径/写失败静默/stats-off 仍跟 guard）、④ GUI 安装助手（临时 HOME 装+卸、known/installed 形状、既有市场保留、cache payload 落地）——离线 mock API 单测 63 项
 - ✅ Grep/Glob 输出形状：从 86 条真实 transcript 确认 = JSON 字符串数组
 - ⚠️ **报表工具注册两处宿主未文档化点**：`$.tool.register` 返回值取 `.tool` 全名（bundle 源码如此，若返形状不符则报表工具不出现，主链路无损）；`$.fs.list` 条目形状未文档化（string/{name} 双兼容 + 抛错即空账本）。`/login` 后开 `WB_OPS_STATS=1` 看工具列表里有无 `mcp__wb_ops__report`。
 - ⚠️ **`$.session.usage()` 真实返回形状**（bundle 中存在 `{used,size}` 与 `{inputTokens,contextWindow}` 两种构造，代码收 4+3 字段候选，判不出静默）与 `prompt.submit` 返回 `{text,context}` 的宿主合并行为——`/login` 后把上下文灌到 >85% 看是否出现 `[wb-ops 水位]` 行；`session.compact` instructions 合并同理需一次真实 auto-compact 验证。
@@ -112,4 +112,4 @@ node --test test/register.test.ts   # 61 项，全绿（需 Node ≥22.6 的 --e
   # Read 用例：读一个 >200 行的 .log（应见指路 offset=）和一个 800 行内的 .ts（应原样）
   ```
   结果里出现 `[wb-ops]` 标记即闭环；Read/源码用例输出**必须**无标记。
-- ⚠️ GUI marketplace 目录格式装载。
+- ⚠️ GUI 注册表写入格式对照本机宿主自写文件（sana `local@` 记录）复刻，install-gui.mjs 有离线装/卸单测，但 **GUI 重启后的插件列表识别与启用点击**未验证。
