@@ -6,9 +6,10 @@
 |---|---|---|---|
 | v0.12.0 | 2026-11-05 | ✅ 三项全过（沙箱读权限 / 水位提醒 / auto-compact 合并） | `cce1dd1` |
 | v0.12.1 | 2026-11-05 | ✅ 大文件降级（22MB transcript 不再失守） | `802458a` |
-| v0.13 | 2026-11-05 | ⏳ 待真机：token 指标（标记行内联 `≈N tok → ≈M tok（省 P%）` + 报表 tok 口径） | — |
+| v0.13 | 2026-11-05 | ✅ token 指标真机生效（标记行内联省量 + 记账 tok 字段 + 报表同口径） | `9554320` |
+| v0.13.1 | 2026-11-05 | ✅ 修报表工具 GUI 注册失败（宿主会话级 core 不支持 `tool.register`） | 待提交 |
 
-离线单测：**94/94 全绿**（`node --test test/register.test.ts`）。宿主校验器：`plugin validate` ✔、`plugin list` → `enabled`。
+离线单测：**97/97 全绿**（`node --test test/register.test.ts`）。宿主校验器：`plugin validate` ✔、`plugin list` → `enabled`。
 
 ---
 
@@ -143,6 +144,98 @@ CLI 跑不了模型回合（LLM 摘要到不了），但宿主会走**工程压�
 
 ---
 
+## 3.5 v0.13：token 指标真机验收（2026-11-05）
+
+**结论：✅ 通过**。本会话（sid `fa2b121e`）即真机现场，证据来自真实工具输出与落盘文件。
+
+### ① 标记行内联省量（`≈N tok → ≈M tok（省 P%）`）
+
+真实 Bash 输出被压缩后，模型侧收到：
+
+```
+[wb-ops] 已省略 28 行 · 原文 8.0KB≈2.0k tok → ≈981 tok（省 52%） · 落盘 …/spill/fa2b121e/9-1793880100493.txt
+```
+
+与 v0.13 前对比（只有字节口径）：`已省略 28 行 · 原文 8.0KB → 落盘 …`。
+
+### ② 记账含 token 字段
+
+`~/.workbuddy/wb-ops/stats/fa2b121e.json`（真实会话）：
+
+```jsonc
+{ "calls": 3, "before": 23157, "after": 11573,
+  "kinds": { "shell": { "calls": 3, "before": 23157, "after": 11573, "tokBefore": 5048, "tokAfter": 2581 } },
+  "tokBefore": 5048, "tokAfter": 2581, "tool": "shell", "ts": "2026-11-05T11:42:09.500Z" }
+```
+
+`tokBefore/tokAfter` 存在 ✅（v0.13 新增字段），`kinds` 每类也带 ✅。
+
+### ③ 报表同口径（沙箱外 `node hooks/report.mjs`）
+
+```
+[wb-ops 报表] 压缩 5 次 · 省 ≈5.7k tok / 23.7KB (60.7%) · 原文 39.1KB≈9.3k tok → 压缩后 15.3KB≈3.6k tok · 记账会话 2 个
+  分类：shell 5次 ≈9.3k→3.6k tok
+  fa2b121e  3 次  22.6KB→11.3KB  最后: shell 2026-11-05
+  32360b9f  2 次  16.4KB→4.0KB  最后: shell 2026-11-05
+  口径：token 为估算（与宿主同公式 ceil(中文/1.8)+ceil(其余/4)）；只计本 Mod 实际改写的输出，被裁原文在 ~/.workbuddy/wb-ops/spill/ 可回查。
+```
+
+首行同时给「省 ≈X tok」与「YKB (P%)」，分类行与明细行口径一致 ✅。
+
+---
+
+## 3.6 v0.13.1：报表工具在 GUI 会话注册不上（2026-11-05）
+
+**现象**：v0.13 发布后，会话内 `mcp__wb_ops__report` 工具**始终不出现在工具清单**里（`ToolSearch` 查无此工具；transcript 里搜不到工具 schema）。而 `hooks/report.mjs` 一切正常 → 说明是**注册环节**失败，不是渲染或口径问题。
+
+### 根因（宿主 bundle 反查 + 探针实测）
+
+宿主有**两条能力不同的 core**，`$.tool.register` 最终落到 core 的 `case"tool.register"` 分支：
+
+```js
+// shared.cjs —— 宿主 bundle
+case"tool.register": return core_handler_value(
+  ea.registerTool ? await ea.registerTool(eS, eE.plugin)
+                   : { tool: `mcp__${eE.plugin.replace(/[^a-zA-Z0-9]/g,"_")}__${eS.name}` });
+```
+
+| core | 来源 | `registerTool` 绑定 | 运行时 |
+|---|---|---|---|
+| 应用级 | `hostBindings` → `createModsCommandToolBindings` | **真实现** → `toolManager.register(ModProxyTool)` | CLI / `--plugin-dir` |
+| 会话级 | `createFunctionalHookBindings` | `registerTool:()=>{throw Error("Session tool registration is not bound")}` | **GUI 会话** |
+
+GUI 会话走会话级 core → 注册**必抛错** → 被 mod 自己的 `catch {}` 吞掉 → 工具整个会话都不存在。
+
+### 探针实测（决定性证据）
+
+写一个临时 mod，`session.start` 里调 `$.tool.register` 并把结果落盘，用 `--plugin-dir` 加载（走应用级 core）：
+
+```jsonc
+// ~/.workbuddy/wb-ops/probe2-session-start.json
+{ "stage": "session.start",
+  "hasToolNs": true,
+  "toolKeys": ["list","register","unregister","call","check","describe"],
+  "registerResult": { "tool": "mcp__wbopsprobe__probereport" } }   // 返回值形状 = {tool:string}
+```
+
+**这条同时排除了两个误判**：① 返回值形状不是问题（就是 `{tool:string}`，与代码解析一致）；② `$.tool` 命名空间存在且 `register` 是函数。唯一变量是**宿主给哪条 core**。
+
+### 修复
+
+| 改动 | 说明 |
+|---|---|
+| 双入口幂等重试 | 注册挂在 `session.start` **与** `prompt.submit`；任一拿到可用 core 即成功，已注册则 O(1) 跳过 |
+| 状态收敛到闭包 | `reportToolName` 从模块级移进 `register()` 闭包——模块级会让「上个会话已注册」短路掉新会话（宿主每会话重新引导 mod） |
+| fail-open 不变 | 注册失败仍吞异常；主链路（压缩 / 落盘 / 水位守卫）零依赖 |
+
+### 验收
+
+- 单测 **97/97 全绿**（新增 3 条：注册失败不炸主链路且 prompt.submit 重试、注册幂等、stats 关闭零注册）。
+- 宿主校验器 `plugin validate` ✔。
+- 探针复跑：`session.start` 与 `prompt.submit` **两个入口都注册成功**（CLI 路径）；GUI 路径待**新开会话**确认（mod 在运行时启动时引导，老会话仍是旧代码）。
+
+---
+
 ## 4. 验证过程踩坑（复现时必读）
 
 | 坑 | 现象 | 规避 |
@@ -152,6 +245,9 @@ CLI 跑不了模型回合（LLM 摘要到不了），但宿主会走**工程压�
 | 中文路径 + Bash 引号 | 命令内联转义失败 | 固化到 `test/run-acceptance.sh`，不写内联长命令 |
 | `install-gui.mjs --uninstall` 首次 ENOENT | 竞态，重跑即成功 | 无需处理 |
 | `txt.length` 是字符数 | 中文场景 bytes/char ≈ 1.1–1.2，字节判断要用 `fs.stat` 的 size | v0.12.1 已改用 stat |
+| **模块级状态跨会话泄漏** | `reportToolName` 放模块级 → 单测里「上个 harness 已注册」短路掉新 harness 的注册；真实运行时同理短路掉新会话 | mod 的**每会话状态**放 `register()` 闭包（宿主每会话重新引导 mod） |
+| **只在一个时机注册** | 宿主不同路径给的 core 能力不同（应用级能注册工具 / 会话级不能）→ 单一入口必挂 | 关键能力挂**多个入口**幂等重试，任一命中即可 |
+| CLI 能注册 ≠ GUI 能注册 | 探针在 `--plugin-dir`（应用级 core）下成功，易误判"代码没问题" | 探针要分别覆盖两条路径；或直接反查 bundle 的绑定表 |
 
 ## 5. 环境还原清单（每次验证后执行）
 
