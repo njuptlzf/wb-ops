@@ -27,7 +27,10 @@ const MARKER = '[wb-ops]';                   // 本 Mod 的标记
 // sana35421/wb-ops（shell-hook 版）的真实标记前缀（trim.py L61-62），共存防双压。
 const FOREIGN_MARKERS = ['[wb-ops 省略', '[wb-ops 以下为原文末尾'];
 
-const DEFAULT_BUDGET = 8000;                 // 预算按 UTF-8 字节计（中文 3 字节≈1 token，按字符会漏）
+const DEFAULT_BUDGET = 4500;                 // 预算按 UTF-8 字节计（中文 3 字节≈1 token，按字符会漏）。
+                                          // 4500 而非 8000：宿主 Bash/Grep 的 <persisted-output> 落盘阈值实测 ≈8KB
+                                          // （"Output too large (8.3KB)"），预算贴近阈值时 mod 的可压缩区间被宿主抢走，
+                                          // 4500 留出 ~45% 余量，保证 (预算, 宿主阈值) 这段"宿主不管"的区间真正归 mod。
 const DEFAULT_DEADLINE_MS = 100;             // 压缩自设软超时；超时放弃，返回原文
 const DEFAULT_GUARD_PCT = 85;                // 水位守卫阈值（%. usage 形状判不出即静默）
 const MAX_SPILL_CHARS = 4_000_000;           // 落盘写入门槛：超过不写（唯一的同步 IO 必须封顶）
@@ -103,13 +106,15 @@ export function hintFor(raw: string): string | null {
 }
 
 interface Cfg { enabled: boolean; budget: number; deadlineMs: number; home: string; stats: boolean; hints: boolean; guard: boolean; guardPct: number; fallback: boolean; }
-type Sink = { put: (s: string) => unknown };
+type Sink = { put: (s: string | string[]) => unknown };
 export interface Compression { text: string; dropped: number; }
+/** extractText 的产物：raw = 可压缩的纯文本；items = 原生字符串数组（宿主 Grep/Glob 形态）；isArray = sink 收数组而非文本。 */
+export interface ExtractResult { raw: string; sink: Sink; items?: string[]; isArray?: boolean }
 
 // ---------------------------------------------------------------- text shape
 
 /** 从未知形状的 ToolResult 中提取可安全替换的纯文本；未知形状返回 null（透传）。 */
-export function extractText(res: unknown): { raw: string; sink: Sink } | null {
+export function extractText(res: unknown): ExtractResult | null {
   if (typeof res === 'string') return { raw: res, sink: { put: (s) => s } };
   if (res && typeof res === 'object') {
     const o = res as Record<string, unknown>;
@@ -124,9 +129,79 @@ export function extractText(res: unknown): { raw: string; sink: Sink } | null {
           sink: { put: (s) => { const c = o.content.slice(); c[i] = { ...c[i], text: s }; return { ...o, content: c }; } },
         };
       }
+      // 宿主 Grep/Glob 的原生形态：content 是**纯字符串数组**（如 ["C:\\a.ts","C:\\b.ts"]），
+      // 不是 {text} 块数组——上面的块分支永远不命中，必须单开一条，否则 jsonlist 通道形同虚设。
+      // 宿主把该数组序列化成 JSON 文本发给模型，所以回写保持"数组"形态最安全（与原生同构）。
+      if (o.content.length > 0 && o.content.every((x) => typeof x === 'string')) {
+        const arr = o.content as string[];
+        return {
+          raw: JSON.stringify(arr),
+          sink: { put: (s) => ({ ...o, content: s }) },
+          items: arr,
+          isArray: true,
+        };
+      }
     }
   }
   return null;
+}
+
+// ------------------------------------------------------------ shape diagnostics
+// 只描述结构（键名 / 类型 / 长度 / 数值），**绝不吐正文**——诊断信息要落盘，不能把工具内容写进磁盘。
+const DEBUG_LIMIT = 20;                       // 每会话诊断条数上限（热路径纪律：低频、可关、失败静默）
+
+export function describeShape(v: unknown, depth = 0): Record<string, unknown> {
+  if (v === null) return { t: 'null' };
+  if (typeof v === 'string') return { t: 'string', len: v.length };
+  if (typeof v === 'number') return { t: 'number', v: Number.isFinite(v) ? v : null };
+  if (typeof v === 'boolean') return { t: 'boolean', v };
+  if (typeof v !== 'object') return { t: typeof v };
+  if (depth >= 2) {
+    const keys = Object.keys(v as object).slice(0, 20);
+    return { t: Array.isArray(v) ? 'array' : 'object', keys };
+  }
+  if (Array.isArray(v)) {
+    const allStr = v.length > 0 && v.every((x) => typeof x === 'string');
+    let totalLen: number | undefined;
+    if (allStr) { totalLen = 0; for (const x of v as string[]) totalLen += x.length; }
+    return { t: 'array', len: v.length, totalLen, first: v.length ? describeShape(v[0], depth + 1) : null };
+  }
+  const o = v as Record<string, unknown>;
+  const keys: Record<string, unknown> = {};
+  for (const k of Object.keys(o).slice(0, 20)) keys[k] = describeShape(o[k], depth + 1);
+  return { t: 'object', keys };
+}
+
+/** 形状里是否存在「长字符串」——判不出文本且内容够大才值得记一条诊断。 */
+export function hasLongString(shape: Record<string, unknown>, min: number): boolean {
+  if (shape.t === 'string' && typeof shape.len === 'number' && shape.len >= min) return true;
+  if (shape.t === 'array') {
+    if (typeof shape.totalLen === 'number' && shape.totalLen >= min) return true;
+    return !!shape.first && hasLongString(shape.first as Record<string, unknown>, min);
+  }
+  if (shape.t === 'object' && shape.keys && typeof shape.keys === 'object') {
+    for (const k of Object.keys(shape.keys as object)) {
+      if (hasLongString((shape.keys as Record<string, unknown>)[k], min)) return true;
+    }
+  }
+  return false;
+}
+
+/** 诊断落盘：~/.workbuddy/wb-ops/debug/<name>-<sid>.json（最多 20 条，失败静默）。 */
+async function writeDebug($: any, home: string, sid: string, name: string, entry: Record<string, unknown>): Promise<void> {
+  try {
+    if (!home) return;
+    const dir = `${home.replace(/\\/g, '/')}/.workbuddy/wb-ops/debug`;
+    const path = `${dir}/${name}-${sid}.json`;
+    let rows: unknown[] = [];
+    try {
+      const cur = await $.fs.read(path);
+      const txt = typeof cur === 'string' ? cur : cur && typeof (cur as { text?: unknown }).text === 'string' ? (cur as { text: string }).text : '';
+      if (txt) { const p = JSON.parse(txt); if (Array.isArray(p)) rows = p; }
+    } catch { /* 首次：没有就空数组 */ }
+    rows.push({ t: new Date().toISOString(), ...entry });
+    await $.fs.write(path, JSON.stringify(rows.slice(-DEBUG_LIMIT)));
+  } catch { /* 诊断失败不影响主链路 */ }
 }
 
 // ---------------------------------------------------------------- byte utils
@@ -350,8 +425,8 @@ export function compress(
   return { text, dropped };
 }
 
-/** Grep/Glob 的 JSON 数组模式：前 K 条 + 计数 + 落盘（列表尾部条目不比头部更值钱，不硬凑尾段）。 */
-export function compressList(items: string[], budget: number, spillPath: string | null, rawBytes: number): Compression {
+/** 字符串数组的裁剪内核：保留前 K 条（按字节预算）+ 一条**单行**说明（列表尾部条目不比头部更值钱，不硬凑尾段）。 */
+export function trimList(items: string[], budget: number, spillPath: string | null, rawBytes: number): { kept: string[]; note: string; dropped: number } {
   const cap = Math.floor(budget * 0.7);
   let used = 0, k = 0;
   for (const it of items) {
@@ -361,7 +436,22 @@ export function compressList(items: string[], budget: number, spillPath: string 
   }
   const kept = items.slice(0, k).map(truncLine);
   const note = `${MARKER} 共 ${items.length} 条，已省略 ${items.length - k} 条 · 原文 ${rawBytes}B → ${spillPath ? '落盘 ' + spillPath : '未落盘（原文过大或写入失败，可重跑命令）'}`;
-  return { text: kept.join('\n') + '\n' + note, dropped: items.length - k };
+  return { kept, note, dropped: items.length - k };
+}
+
+/** Grep/Glob 的 JSON 数组模式：前 K 条 + 计数 + 落盘（文本形态：结果本身是一段 JSON 文本时走这里）。 */
+export function compressList(items: string[], budget: number, spillPath: string | null, rawBytes: number): Compression {
+  const { kept, note, dropped } = trimList(items, budget, spillPath, rawBytes);
+  return { text: kept.join('\n') + '\n' + note, dropped };
+}
+
+/** 工具名（诊断用）：宿主事件里的工具名字段名未文档化，多候选取第一个。 */
+export function toolNameOf(e: any): string {
+  for (const k of ['tool', 'toolName', 'name', 'tool_name']) {
+    const v = e?.[k];
+    if (typeof v === 'string' && v) return v;
+  }
+  return '?';
 }
 
 // ------------------------------------------------------------------ config
@@ -464,6 +554,27 @@ export function renderSummary(rows: StatRow[]): string {
 
 // ---------------------------------------------------------------- guard (#4/#5)
 
+let lastUsageSig: string | null = null;   // usage 形状签名：变了才落盘（每轮写盘违反热路径纪律）
+
+/**
+ * usage 探测：拿真实返回形状（只记结构，不记内容），同时把原值交回水位守卫。
+ * 宿主契约实测（bundle）：`i.usage ? core_handler_value(await i.usage(h)) : deny("$.session.usage", …)`
+ * —— core_handler_value 把值包成 {value:…}，deny 包成 {deny:"… is unavailable: …"}；
+ * 宿主 session 自身还有 usage?.outputTokens（**"本轮 token 统计"味道，未见"上下文占用/窗口"语义**）。
+ * 语义未确认前守卫只判形状不猜含义：判不出 → 静默，绝不误报。
+ */
+export async function probeUsage($: any): Promise<{ value?: unknown; shape?: Record<string, unknown>; err?: string; deny?: string }> {
+  try {
+    const sess: any = $.session;
+    if (!sess || typeof sess.usage !== 'function') return { err: '$.session.usage is not a function' };
+    const value = await sess.usage();
+    const deny = value && typeof value === 'object' ? (value as Record<string, unknown>).deny : undefined;
+    return { value, shape: describeShape(value), deny: typeof deny === 'string' ? deny : undefined };
+  } catch (e) {
+    return { err: String(e) };
+  }
+}
+
 // $.session.usage() 返回形状宿主未文档化（bundle 里同时存在 {used,size} 与 {inputTokens,contextWindow} 两种构造）
 // → 多字段候选；判不出返回 null，守卫静默（对齐 sana 事故的根治：无阻塞、无扫描、可整体关闭）
 export function pickWatermark(u: unknown): { used: number; size: number } | null {
@@ -541,7 +652,16 @@ function makeHandler(kind: string) {
       if (!cfg.enabled) return r;
       if (kind === 'other' && !cfg.fallback) return r; // ③ 兜底单独开关：WB_OPS_FALLBACK=0
       const t = extractText(r.result);
-      if (!t) return r;
+      if (!t) {
+        // 判不出文本形状 → 记一条**结构**诊断（只写键名/类型/长度，不写正文）。
+        // 用途：宿主改形状时能立刻定位，不用再去 180MB bundle 里捞。频率天然低（只在这里写盘）。
+        const shape = describeShape(r.result);
+        if (hasLongString(shape, cfg.budget)) {
+          const sidDbg = await getSid8($);
+          await writeDebug($, cfg.home, sidDbg, 'shape', { kind, tool: toolNameOf(e), shape });
+        }
+        return r;
+      }
       const len = t.raw.length;
 
       // shell 类（含 ③ 兜底的未知工具——MCP bash 包装同样遵守 Exit Code 尾标）：非零 → 现场完整透传。
@@ -574,12 +694,23 @@ function makeHandler(kind: string) {
 
       const sid = await getSid8($);
 
-      const items = kind === 'jsonlist' ? parseJsonList(t.raw) : null;
-      if (items) {
-        const path = await spillRaw($, e, t.raw, cfg.home, sid, '.json');
-        const out = compressList(items, cfg.budget, path, bytes);
-        if (cfg.stats && cfg.home) await recordStats($, cfg.home, sid, kind, bytes, byteLen(out.text));
-        return { ...r, result: t.sink.put(out.text) };
+      if (kind === 'jsonlist') {
+        // 两条来源：① 原生数组（宿主 Grep/Glob：content 是 string[]）② 文本形态（结果本身是一段 JSON 文本）
+        const listItems = t.items ?? parseJsonList(t.raw);
+        if (listItems) {
+          const path = await spillRaw($, e, t.raw, cfg.home, sid, '.json');
+          if (t.isArray) {
+            // 原生数组：裁条目 + 追加一条单行说明，**保持数组形态**（宿主会序列化成 JSON 文本给模型，
+            // 与原生同构；改成字符串会撞上渲染器对 content 类型的假设）。
+            const { kept, note, dropped } = trimList(listItems, cfg.budget, path, bytes);
+            const arr = [...kept, note];
+            if (cfg.stats && cfg.home) await recordStats($, cfg.home, sid, kind, bytes, byteLen(arr.join('\n')));
+            return { ...r, result: t.sink.put(arr) };
+          }
+          const out = compressList(listItems, cfg.budget, path, bytes);
+          if (cfg.stats && cfg.home) await recordStats($, cfg.home, sid, kind, bytes, byteLen(out.text));
+          return { ...r, result: t.sink.put(out.text) };
+        }
       }
 
       const opts = kind === 'read'
@@ -644,7 +775,16 @@ export function register(on: On, _options?: unknown): void {
     try {
       const cfg = await readCfg($);
       if (cfg.enabled && cfg.guard) {
-        const w = pickWatermark(await $.session.usage());
+        // 一次读取两用：① 探测真实形状（写 debug，只记结构/数值）② 喂水位守卫
+        const probe = await probeUsage($);
+        if (probe.shape || probe.err) {
+          const sig = JSON.stringify(probe.shape ?? probe.err);
+          if (sig !== lastUsageSig) {          // 形状没变就不重复落盘
+            lastUsageSig = sig;
+            await writeDebug($, cfg.home, await getSid8($), 'usage', { shape: probe.shape, deny: probe.deny, err: probe.err });
+          }
+        }
+        const w = pickWatermark(probe.value);
         let note: string | null = null;
         if (w) {
           // ② 每轮把余量写进 <sid8>.num（几十字节小文件，进程内 fs）——越线提醒之外让模型可主动查
