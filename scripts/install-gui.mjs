@@ -45,16 +45,26 @@ function readJson(file, fallback) {
   try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return fallback; }
 }
 
+// 载荷目录：清单 + mod + 报表 MCP 服务器 + 共用渲染核心。
+// v0.14 起 mcp/ 与 lib/ 是**运行时必需**（plugin.json 的 mcpServers 指向 mcp/server.mjs，
+// 后者 import ../lib/report-core.mjs）——漏拷任何一个，工具都会在宿主侧起不来。
+const PAYLOAD_DIRS = ['.codebuddy-plugin', 'hooks', 'lib', 'mcp'];
+
+function copyDir(from, to) {
+  if (!existsSync(join(REPO, from))) return;
+  cpSync(join(REPO, from), join(to, from), { recursive: true });
+}
+
 function copyPayload() {
-  // 市场目录：marketplaces/<MKT>/wb-ops/{.codebuddy-plugin,hooks}
+  // 市场目录：marketplaces/<MKT>/wb-ops/<payload>
   const mktPlugin = join(mkPath, PID);
   rmSync(mktPlugin, { recursive: true, force: true });
   mkdirSync(mktPlugin, { recursive: true });
-  for (const d of ['.codebuddy-plugin', 'hooks']) cpSync(join(REPO, d), join(mktPlugin, d), { recursive: true });
+  for (const d of PAYLOAD_DIRS) copyDir(d, mktPlugin);
   // 缓存目录：cache/<MKT>/wb-ops/<version>/ 同 payload（宿主把「已安装版本」冻结在 cache）
   rmSync(cachePath, { recursive: true, force: true });
   mkdirSync(cachePath, { recursive: true });
-  for (const d of ['.codebuddy-plugin', 'hooks']) cpSync(join(REPO, d), join(cachePath, d), { recursive: true });
+  for (const d of PAYLOAD_DIRS) copyDir(d, cachePath);
 }
 
 // 市场清单：市场根目录下 .codebuddy-plugin/marketplace.json（官方文档要求；缺了宿主列不出该市场）

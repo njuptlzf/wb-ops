@@ -1,18 +1,19 @@
 /**
- * wb-ops 离线单测：node --test test/
+ * wb-ops 离线单测：node --test test/register.test.ts
  * 用 mock 的 $（env/fs/session）驱动 register()，验证透传/压缩/落盘/并发/fail-open/分工具策略。
- * 不依赖 WorkBuddy——宿主真实行为另见 README「待在线验证」。
+ * 报表（v0.14）走 MCP 通道：渲染核心在 lib/report-core.mjs，服务器在 mcp/server.mjs，
+ * 这里用真实子进程做 JSON-RPC 握手验收（与宿主调用方式同构）。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { register, compress, compressList, trimList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, summarizeStats, renderSummary, estTokens, pickWatermark, pickWindow, projectSlug, lastInputTokens, probeTranscript, watermarkLine, guardNote, describeShape, hasLongString, toolNameOf, probeUsage, COMPACT_RETENTION } from '../hooks/register.ts';
+import { register, compress, compressList, trimList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, estTokens, pickWatermark, pickWindow, projectSlug, lastInputTokens, probeTranscript, watermarkLine, guardNote, describeShape, hasLongString, toolNameOf, probeUsage, COMPACT_RETENTION } from '../hooks/register.ts';
+import { collectRows, renderSummary, summarize, EMPTY_TEXT } from '../lib/report-core.mjs';
 
-function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean; listFail?: boolean; list?: unknown[]; files?: Record<string, string>; usage?: unknown; usageFail?: boolean; cwd?: string; registerFail?: boolean } = {}) {
+function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean; listFail?: boolean; list?: unknown[]; files?: Record<string, string>; usage?: unknown; usageFail?: boolean; cwd?: string } = {}) {
   const writes: { path: string; text: string }[] = [];
   const reads: string[] = [];
   const byTool: Record<string, ($: any, e: any, next: any) => Promise<any>> = {};
   const hooks: Array<{ ev: string; matcher: any; h: any }> = [];
-  const regCalls: any[] = [];
   register(((ev: string, m: any, h: any) => {
     if (typeof m === 'function') { hooks.push({ ev, matcher: {}, h: m }); return; } // 2 参形态
     byTool[m.tool] = h;
@@ -24,12 +25,6 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
   const ENV: Record<string, string | undefined> = { WB_OPS_STATS: '0', ...(opts.env ?? {}) };
   const $ = {
     env: { get: async (k: string) => ENV[k] },
-    tool: { register: async (spec: any) => {
-      regCalls.push(spec);
-      // 模拟宿主会话级 core：registerTool 被绑成 throw（GUI 路径真实行为）
-      if (opts.registerFail) throw new Error('Session tool registration is not bound');
-      return { tool: 'mcp__wb_ops__report' };
-    } },
     fs: {
       write: async (p: string, t: string) => {
         if (opts.writeFail) throw new Error('disk on fire');
@@ -73,19 +68,8 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
     if (!hk) throw new Error('session.compact handler not registered');
     return hk.h($, e, async (e2: any) => ({ passed: e2 }));
   };
-  const fireSessionStart = async () => {
-    const hk = hooks.find((k) => k.ev === 'session.start');
-    return hk ? hk.h($, {}, async (e: any) => ({ passed: e })) : null;
-  };
   const fnHooks = (toolName: string) =>
     hooks.filter((k) => k.ev === 'tool.call' && typeof k.matcher.tool === 'function' && k.matcher.tool(toolName));
-  const callReport = async () => {
-    const name = 'mcp__wb_ops__report';
-    const hks = fnHooks(name);
-    if (hks.length !== 1) throw new Error(`report predicate should match own tool exactly once, got ${hks.length}`);
-    const out = await hks[0].h($, { tool: name }, async () => { throw new Error('next must not run for own tool'); });
-    return { skipped: false as const, out };
-  };
   const callUnknown = async (toolName: string, result: unknown, event: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) => {
     const hks = fnHooks(toolName);
     if (hks.length !== 1) throw new Error(`fallback predicate should match unknown tool exactly once, got ${hks.length}`);
@@ -100,7 +84,8 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
   };
   const bash = (result: unknown, event: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) =>
     call('Bash', result, { input: { command: 'npm test' }, ...event }, extra);
-  return { $, writes, reads, call, bash, byTool, regCalls, fireSessionStart, callReport, callUnknown, fnHooks, firePrompt, fireCompact, usageCalls,
+  return { $, writes, reads, call, bash, byTool, callUnknown, fnHooks, firePrompt, fireCompact, usageCalls,
+    events: () => Array.from(new Set(hooks.map((k) => k.ev))),
     setEnv: (k: string, v: string | undefined) => { ENV[k] = v; } };
 }
 
@@ -487,15 +472,17 @@ test('renderSummary token 口径（有 tok 字段走 tok，分类行同源）', 
   assert.match(txt, /分类：shell 1次 ≈1\.0k→250 tok/);
 });
 
-// ---------------------------------------------------------------- report (#3)
+// ------------------------------------- report (#3) v0.14：改走插件声明的 MCP 服务器
 
-test('renderSummary 空账本', () => {
-  assert.equal(summarizeStats([]).calls, 0);
-  assert.match(renderSummary([]), /还没有记账数据/);
+test('report-core：空账本 / 目录不存在都返回同一句提示', async () => {
+  const { join } = await import('node:path');
+  assert.equal(summarize([]).calls, 0);
+  assert.equal(renderSummary([]), EMPTY_TEXT);
   assert.match(renderSummary([{ file: 'a.json', calls: 0, before: 0, after: 0 }]), /还没有记账数据/);
+  assert.equal(collectRows(join(import.meta.dirname, 'no-such-dir')).length, 0, '目录不存在 → 空，不抛');
 });
 
-test('renderSummary 汇总行', () => {
+test('report-core：汇总行字节口径与排序', () => {
   const txt = renderSummary([
     { file: 'aaaa1111.json', calls: 5, before: 40960, after: 8192, tool: 'shell', ts: '2026-11-04T10:00:00.000Z' },
     { file: 'bbbb2222.json', calls: 2, before: 2048, after: 1024, tool: 'read', ts: '2026-11-03T10:00:00.000Z' },
@@ -507,76 +494,120 @@ test('renderSummary 汇总行', () => {
   assert.ok(txt.indexOf('aaaa1111') < txt.indexOf('bbbb2222'), '按 ts 新→旧排');
 });
 
-test('stats 开启：session.start 注册 report 工具', async () => {
-  const h = harness({ env: { ...HOME, WB_OPS_STATS: '1' } });
-  const res = await h.fireSessionStart();
-  assert.deepEqual(res, { passed: {} }, '必须透传 next');
-  assert.equal(h.regCalls.length, 1);
-  assert.equal(h.regCalls[0].name, 'report');
-  assert.equal(typeof h.regCalls[0].description, 'string');
-  assert.equal(h.regCalls[0].inputSchema.type, 'object');
+test('report-core：读目录聚合（坏文件跳过、kinds 折叠、ts 新→旧）', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const home = mkdtempSync(join(tmpdir(), 'wbops-core-'));
+  try {
+    const dir = join(home, '.workbuddy', 'wb-ops', 'stats');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'sid1.json'), JSON.stringify({ calls: 3, before: 30000, after: 5000, tool: 'jsonlist', ts: '2026-11-04T09:00:00.000Z', kinds: { jsonlist: { calls: 2, before: 24000, after: 3200 }, shell: { calls: 1, before: 6000, after: 1800 } } }));
+    writeFileSync(join(dir, 'bad.json'), '{broken');
+    writeFileSync(join(dir, 'notes.txt'), 'ignore me');
+    const rows = collectRows(dir);
+    assert.equal(rows.length, 1, '坏 JSON 与非 .json 都被跳过');
+    const txt = renderSummary(rows);
+    assert.ok(txt.includes('压缩 3 次'));
+    assert.match(txt, /分类：jsonlist 2次 23\.4KB→3\.1KB · shell 1次 5\.9KB→1\.8KB/);
+    assert.ok(txt.includes('jsonlist'), '最后 tool 字段透出');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
-test('v0.13.1 注册失败不炸主链路：session.start 抛错时 prompt.submit 应重试', async () => {
-  // 回归用例：宿主 GUI 会话走会话级 core，registerTool 被绑成 throw（"Session tool registration is not bound"）。
-  // 修复前：注册只在 session.start 试一次 → 抛错被吞 → 报表工具整个会话都不存在。
-  // 修复后：prompt.submit 是第二个注册入口 → 重试成功；且两次都不抛、不影响主链路。
-  const h = harness({ env: { ...HOME, WB_OPS_STATS: '1' }, registerFail: true });
+test('v0.14 MCP 全链路：initialize → tools/list → tools/call（真实子进程，与宿主调用同构）', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { spawn } = await import('node:child_process');
+  const home = mkdtempSync(join(tmpdir(), 'wbops-mcp-'));
+  const dir = join(home, '.workbuddy', 'wb-ops', 'stats');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'sid1.json'), JSON.stringify({ calls: 2, before: 10000, after: 1500, tokBefore: 3000, tokAfter: 500, tool: 'shell', ts: '2026-11-04T08:00:00.000Z' }));
 
-  const s1 = await h.fireSessionStart();                       // 抛错被 mod 吞掉，但必须透传 next
-  assert.deepEqual(s1, { passed: {} }, '注册失败也必须透传 next（fail-open）');
-  assert.equal(h.regCalls.length, 1, 'session.start 确实尝试过注册');
-
-  const p1 = await h.firePrompt();                             // 第二个入口：再试一次（仍失败但不能炸）
-  assert.ok(p1, 'prompt.submit 必须正常返回');
-  assert.equal(h.regCalls.length, 2, 'prompt.submit 应重试注册一次');
-});
-
-test('v0.13.1 注册幂等：session.start 成功后 prompt.submit 不重复注册', async () => {
-  const h = harness({ env: { ...HOME, WB_OPS_STATS: '1' } });
-  await h.fireSessionStart();
-  assert.equal(h.regCalls.length, 1);
-  await h.firePrompt();
-  assert.equal(h.regCalls.length, 1, '已注册则不再重复注册（省一次 host 调用）');
-});
-
-test('v0.13.1 stats 关闭：不发起任何注册调用', async () => {
-  const h = harness({ env: { ...HOME, WB_OPS_STATS: '0' } });
-  await h.fireSessionStart();
-  await h.firePrompt();
-  assert.equal(h.regCalls.length, 0, '记账关闭时不注册（不往提示词塞 schema）');
-});
-
-test('report 工具：读目录聚合渲染（谓词命中、next 不可达）', async () => {
-  const dir = 'C:/tmp-home/.workbuddy/wb-ops/stats';
-  const h = harness({
-    env: { ...HOME, WB_OPS_STATS: '1' },
-    list: ['aaaa1111.json', 'bad.json', 'notes.txt'],
-    files: { [`${dir}/aaaa1111.json`]: JSON.stringify({ calls: 3, before: 30000, after: 5000, tool: 'jsonlist', ts: '2026-11-04T09:00:00.000Z', kinds: { jsonlist: { calls: 2, before: 24000, after: 3200 }, shell: { calls: 1, before: 6000, after: 1800 } } }) },
+  const child = spawn(process.execPath, [join(import.meta.dirname, '..', 'mcp', 'server.mjs')], {
+    env: { ...process.env, USERPROFILE: home, HOME: home, WB_OPS_HOME: home },
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
-  await h.fireSessionStart(); // 注册 report → 谓词命中自己、兜底排除
-  const { out } = await h.callReport();
-  assert.ok(out.result.includes('压缩 3 次'));
-  assert.match(out.result, /分类：jsonlist 2次 23\.4KB→3\.1KB · shell 1次 5\.9KB→1\.8KB/);
-  assert.ok(out.result.includes('jsonlist'), '最后 tool 字段透出');
-  assert.ok(!out.result.includes('bad'), '坏 JSON 行被跳过');
+  child.stdout.setEncoding('utf8');
+  const pending = new Map<number, (m: any) => void>();
+  const dirty: string[] = [];
+  let buf = '';
+  child.stdout.on('data', (chunk: string) => {
+    buf += chunk;
+    let i: number;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      if (!line) continue;
+      try {
+        const msg = JSON.parse(line);
+        const cb = pending.get(msg.id);
+        if (cb) { pending.delete(msg.id); cb(msg); }
+      } catch { dirty.push(line); }          // stdout 混进非 JSON 就是协议违规
+    }
+  });
+  let seq = 0;
+  const rpc = (method: string, params?: unknown) => new Promise<any>((resolve, reject) => {
+    const id = ++seq;
+    pending.set(id, resolve);
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+    setTimeout(() => { if (pending.delete(id)) reject(new Error('MCP 超时: ' + method)); }, 8000).unref();
+  });
+
+  try {
+    const init = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'wb-ops-test', version: '0' } });
+    assert.equal(init.result.protocolVersion, '2025-06-18', '回显客户端协议版本，不硬编码');
+    assert.equal(init.result.serverInfo.name, 'wb-ops-report');
+    assert.ok(init.result.capabilities.tools, '必须声明 tools 能力');
+
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+
+    const list = await rpc('tools/list');
+    assert.equal(list.result.tools.length, 1);
+    assert.equal(list.result.tools[0].name, 'report', '工具名 report × server key wb_ops = mcp__wb_ops__report');
+    assert.equal(list.result.tools[0].inputSchema.type, 'object');
+
+    const call = await rpc('tools/call', { name: 'report', arguments: {} });
+    assert.equal(call.result.isError, false);
+    const text = call.result.content[0].text as string;
+    assert.ok(text.includes('压缩 2 次'), text);
+    assert.match(text, /省 ≈2\.5k tok/, text);
+
+    const miss = await rpc('tools/call', { name: 'nope', arguments: {} });
+    assert.equal(miss.error.code, -32602, '未知工具 → InvalidParams');
+
+    const unknown = await rpc('no/such/method');
+    assert.equal(unknown.error.code, -32601, '未知方法 → MethodNotFound');
+
+    assert.deepEqual(dirty, [], 'stdout 只许有 JSON-RPC 报文');
+  } finally {
+    child.kill();
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
-test('report 工具：fs.list 抛错 → 空账本文案（fail-open）', async () => {
-  const h = harness({ env: { ...HOME, WB_OPS_STATS: '1' }, listFail: true });
-  await h.fireSessionStart();
-  const { out } = await h.callReport();
-  assert.match(out.result, /还没有记账数据/);
+test('v0.14 清单守卫：plugin.json 用 mcpServers.wb_ops 声明报表服务器', async () => {
+  const { readFileSync, existsSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const root = join(import.meta.dirname, '..');
+  const manifest = JSON.parse(readFileSync(join(root, '.codebuddy-plugin', 'plugin.json'), 'utf8'));
+  const server = manifest.mcpServers?.wb_ops;
+  assert.ok(server, 'server key 必须是 wb_ops——工具名 mcp__wb_ops__report 由它决定');
+  assert.equal(server.command, 'node');
+  assert.match(server.args[0], /^\$\{CODEBUDDY_PLUGIN_ROOT\}\/mcp\/server\.mjs$/);
+  assert.ok(existsSync(join(root, 'mcp', 'server.mjs')), '声明的入口必须存在');
+  // 旧路径残留守卫：mod 侧不得再出现 $.tool.register（GUI 会话级 core 必抛）
+  const mod = readFileSync(join(root, 'hooks', 'register.ts'), 'utf8');
+  assert.ok(!/\.tool\.register/.test(mod), 'mod 不得再调 $.tool.register');
 });
 
-test('report 工具：stats 未开 → 提示文案', async () => {
-  // 注意：reportToolName 现在是 **register() 闭包内**的状态（每会话独立），
-  // 因此必须在**同一个 harness** 里先注册、再关掉 stats，才能命中自家 handler。
-  const h = harness({ env: { ...HOME, WB_OPS_STATS: '1' } });
-  await h.fireSessionStart();          // 本会话注册过（设置 reportToolName）
-  h.setEnv('WB_OPS_STATS', '0');       // 随后 stats 关掉 → 防御分支
-  const { out } = await h.callReport();
-  assert.match(out.result, /报表未启用/);
+test('v0.14 mod 不再自注册工具：没有 session.start 钩子，$ 缺 tool 命名空间也照常跑', async () => {
+  const h = harness({ env: HOME });
+  assert.ok(!h.events().includes('session.start'), 'v0.13.1 的注册钩子必须已删——留着只会误导下一个人');
+  const p = await h.firePrompt();           // harness 的 $ 本来就没有 tool 命名空间
+  assert.equal(p.text, '继续');
 });
 
 // ---------------------------------------------------------------- fallback (③)
@@ -621,11 +652,10 @@ test('③ 兜底：WB_OPS_FALLBACK=0 → 未知工具透传，白名单不受影
   assert.ok((b.out.result as string).includes('[wb-ops]'), '白名单照常压缩');
 });
 
-test('③ 兜底：谓词互斥——已知工具与自家报表工具不被兜底双命中', async () => {
-  const reg = harness({ env: { ...HOME, WB_OPS_STATS: '1' } });
-  await reg.fireSessionStart();
-  assert.equal(reg.fnHooks('Bash').length, 0, 'Bash 只走字面 matcher');
-  assert.equal(reg.fnHooks('mcp__wb_ops__report').length, 1, 'report 名只命中自家 handler');
+test('③ 兜底：谓词互斥——已知工具走字面 matcher，MCP 工具（含自家报表）走兜底', () => {
+  const h = harness({ env: HOME });
+  assert.equal(h.fnHooks('Bash').length, 0, 'Bash 只走字面 matcher');
+  assert.equal(h.fnHooks('mcp__wb_ops__report').length, 1, '报表是 MCP 工具 → 由兜底接管（输出小，预算内原样透传）');
 });
 
 // ---------------------------------------------------------------- guard (#4/#5)

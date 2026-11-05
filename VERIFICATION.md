@@ -7,9 +7,10 @@
 | v0.12.0 | 2026-11-05 | ✅ 三项全过（沙箱读权限 / 水位提醒 / auto-compact 合并） | `cce1dd1` |
 | v0.12.1 | 2026-11-05 | ✅ 大文件降级（22MB transcript 不再失守） | `802458a` |
 | v0.13 | 2026-11-05 | ✅ token 指标真机生效（标记行内联省量 + 记账 tok 字段 + 报表同口径） | `9554320` |
-| v0.13.1 | 2026-11-05 | ✅ 修报表工具 GUI 注册失败（宿主会话级 core 不支持 `tool.register`） | 待提交 |
+| v0.13.1 | 2026-11-05 | ❌ **修法无效**（GUI 换入口换不到可用 core；新会话复核未通过，见 3.6 警告与 3.7） | `429e616` |
+| v0.14 | 2026-11-05 | ✅ 报表工具改走插件声明的 MCP 服务器（安装态握手通过；GUI 新会话待最终确认） | 待提交 |
 
-离线单测：**97/97 全绿**（`node --test test/register.test.ts`）。宿主校验器：`plugin validate` ✔、`plugin list` → `enabled`。
+离线单测：**94/94 全绿**（`node --test test/register.test.ts`）。宿主校验器：`plugin validate` ✔、`plugin list` → `enabled`。安装态探针：`node test/probe-installed-mcp.mjs` ✔。
 
 ---
 
@@ -234,6 +235,86 @@ GUI 会话走会话级 core → 注册**必抛错** → 被 mod 自己的 `catch
 - 宿主校验器 `plugin validate` ✔。
 - 探针复跑：`session.start` 与 `prompt.submit` **两个入口都注册成功**（CLI 路径）；GUI 路径待**新开会话**确认（mod 在运行时启动时引导，老会话仍是旧代码）。
 
+> **⚠️ 本节修法已被证伪（2026-11-05 新开会话复核）**：`mcp__wb_ops__report` 仍未出现在工具清单。
+> 原因见 3.7：GUI 会话里 `session.start` 与 `prompt.submit` 拿到的是**同一个**会话级 core，
+> 换时机不可能换到可用绑定；而当时的探针走的是 CLI 应用级 core——**验证路径与故障路径不是同一条**。
+> 保留本节是为了记住这个教训：拿到「证据」时要先问它来自哪条路径。
+
+---
+
+## 3.7 v0.14：报表工具改走 MCP（2026-11-05）
+
+### 复核结果：v0.13.1 无效
+
+新开会话（session `1e4ddce9`，mod 已加载——`debug/usage-1e4ddce9.json` 与 `stats/1e4ddce9.json` 都在写）后：
+
+- `ToolSearch` 精确查 `mcp__wb_ops__report` → **No matching tools found**；
+- 本会话可用工具清单里没有任何 `mcp__wb_ops__*`。
+
+即：mod 的压缩/水位/记账全在跑，**只有工具注册没成**——与 v0.13.1 的诊断一致，但修法没生效。
+
+### 根因（补完 v0.13.1 缺的那半句）
+
+`createFunctionalHooks` 里 core 只造**一次**，然后交给整个 `ModsRuntime`：
+
+```js
+makeCore = (getSession, signal, roots) => Mods.createCoreHandler({
+  bindings: {
+    ...createFunctionalHookBindings({ getSession, cwd, report, pluginRoots }),
+    sessionId,
+    registerTool:   () => { throw Error("Session tool registration is not bound") },
+    registerCommand:() => { throw Error("Session command registration is not bound") },
+    registerAgent:  () => { throw Error("Session agent registration is not bound") },
+  }, signal,
+});
+```
+
+`session.start`、`prompt.submit`、`tool.call` 全部经由这一个 core 派发。所以**「多入口重试」在 GUI 下是自欺**：两次调用打在同一堵墙上。v0.13.1 表格里「运行时/GUI 会话走这条」的结论本身没错，错在**以为换入口等于换 core**。
+
+### 修法：换通道，不换时机
+
+插件清单直接声明 MCP 服务器，由宿主 MCP 管理器起进程并注册工具，完全绕开 mod core：
+
+```jsonc
+// .codebuddy-plugin/plugin.json
+"mcpServers": {
+  "wb_ops": { "command": "node", "args": ["${CODEBUDDY_PLUGIN_ROOT}/mcp/server.mjs"] }
+}
+```
+
+工具名 = `mcp__<serverKey>__<toolName>` = `mcp__wb_ops__report`（`serverKey` 取 `wb_ops` 才与旧名一致）。
+
+**这条路的宿主支持是三处证据坐实的**（不是照抄配置）：
+
+1. 内置插件同法：`builtin-calendar`（http）、`workbuddy-sheetagent`（stdio，`${CODEBUDDY_PLUGIN_ROOT}/mcp/start.mjs`）。
+2. `McpConfigManager.readMcpServersFromPlugins()` 遍历 `pluginManager.getActivePlugins()`，把各插件 `components.mcpServers` 合并进 MCP 配置。
+3. `enrichWithPluginEnvironment()` 对 stdio 声明做替换后交给 MCP 管理器：
+   ```js
+   out[name] = { ...srv,
+     command: substitute(srv.command),
+     args: srv.args?.map(substitute),
+     ...(srv.cwd && { cwd: substitute(srv.cwd) }),
+     env: { ...srv.env, ...await buildPluginSubprocessEnvironment(pluginCtx) } };
+   ```
+   `substitute` = `substitutePluginVariables(..., {mode:"config", expandEnvironment:true})`，负责 `${CODEBUDDY_PLUGIN_ROOT}` / `${CLAUDE_PLUGIN_ROOT}` / `${CODEBUDDY_PLUGIN_DATA}`。
+
+### 验收（本机）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 清单合法 | `plugin validate .` | ✔ Validation passed |
+| 安装树齐备 | `ls cache/wb-ops-local/wb-ops/0.14.0` | `.codebuddy-plugin hooks lib mcp`（新增 `lib` `mcp`） |
+| 安装态服务器可跑 | `node test/probe-installed-mcp.mjs` | `serverInfo{name:"wb-ops-report",version:"0.14.0"}` · `tools/list: report` · `tools/call isError=false` · stdout 脏行 0 |
+| 真实报表内容 | 同上 | `[wb-ops 报表] 压缩 28 次 · 省 ≈65.5k tok / 258.1KB (72.9%) · 原文 354.3KB≈89.3k tok → 压缩后 96.1KB≈23.7k tok · 记账会话 3 个` |
+| 协议兼容 | 单测（真子进程） | `initialize` 回显 `2025-06-18`、未知工具 -32602、未知方法 -32601 |
+| mod 钩子收敛 | CLI 启动日志 | `mods: loaded mod "wb-ops" ... hooks: tool.call prompt.submit session.compact`（`session.start` 已消失） |
+| 离线单测 | `node --test test/register.test.ts` | **94/94 全绿** |
+
+### 仍未验（诚实标注）
+
+- GUI **新会话**里工具是否真的出现在清单——取决于宿主是否为新运行时重新装配插件 MCP。`/reload-plugins` 对 mod 的 `bootstrapFunctionHookMods` 无效（记忆化），对 MCP 组件是否有效未验；**新开对话是确定路径**。
+- `WB_OPS_STATS=0` 时是否仍会起 MCP 进程：当前不联动（工具在、数据为空时返回「还没有记账数据」）。若嫌多一个进程，可后续给 `mcpServers` 加条件式声明（宿主不支持条件，需要拆分插件）。
+
 ---
 
 ## 4. 验证过程踩坑（复现时必读）
@@ -246,7 +327,8 @@ GUI 会话走会话级 core → 注册**必抛错** → 被 mod 自己的 `catch
 | `install-gui.mjs --uninstall` 首次 ENOENT | 竞态，重跑即成功 | 无需处理 |
 | `txt.length` 是字符数 | 中文场景 bytes/char ≈ 1.1–1.2，字节判断要用 `fs.stat` 的 size | v0.12.1 已改用 stat |
 | **模块级状态跨会话泄漏** | `reportToolName` 放模块级 → 单测里「上个 harness 已注册」短路掉新 harness 的注册；真实运行时同理短路掉新会话 | mod 的**每会话状态**放 `register()` 闭包（宿主每会话重新引导 mod） |
-| **只在一个时机注册** | 宿主不同路径给的 core 能力不同（应用级能注册工具 / 会话级不能）→ 单一入口必挂 | 关键能力挂**多个入口**幂等重试，任一命中即可 |
+| **换入口 ≠ 换 core（v0.13.1 的教训）** | 同一个 `ModsRuntime` 的所有钩子共用**一个** core；`session.start` 注册失败换 `prompt.submit` 重试，打的是同一堵墙，`catch{}` 还会把证据吞掉 | 先确认**能力差异在哪个维度**（时机？路径？core？），再选修法；能力问题换通道，别换时机——v0.14 直接放弃 mod 注册、改走 MCP |
+| **只在一个时机注册** | 宿主不同路径给的 core 能力不同（应用级能注册工具 / 会话级不能）→ 单一入口必挂 | ~~关键能力挂多个入口幂等重试~~（此条已被上一条取代：入口重试只对「同一能力、不同时机」有效；**不同路径的能力差异要换通道**） |
 | CLI 能注册 ≠ GUI 能注册 | 探针在 `--plugin-dir`（应用级 core）下成功，易误判"代码没问题" | 探针要分别覆盖两条路径；或直接反查 bundle 的绑定表 |
 
 ## 5. 环境还原清单（每次验证后执行）

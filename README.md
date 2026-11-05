@@ -2,7 +2,7 @@
 
 WorkBuddy 的**上下文治理 Mod**（Mod-first）：进程内 `tool.call` 中间件，在工具结果进入模型上下文之前做确定性压缩，原文落盘可回查。错误输出**永不压缩**。目标只有一个：**降本增效——让进入上下文的每一份 token 都携带高价值信息**。
 
-当前版本 v0.13.1 覆盖 **8 个高频出口 + 通配兜底**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（宿主原生字符串数组 + JSON 数组文本两种形态）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）；开启记账后提供省量报表（会话内 `mcp__wb_ops__report` 工具 + 沙箱外 `node hooks/report.mjs`，按工具类型细分 分类 行；**v0.13 起默认开**，每次压缩的标记行还内联 `≈N tok → ≈M tok（省 P%）`）；上下文水位守卫（prompt.submit ≥85% 一行提醒）与压缩保留指示（session.compact instructions，Mod 版 PreCompact）；POLICY 之外的所有工具名（MCP、宿主新增）由谓词 matcher 兜底走通用压缩。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
+当前版本 v0.14.0 覆盖 **8 个高频出口 + 通配兜底**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（宿主原生字符串数组 + JSON 数组文本两种形态）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）；省量报表（会话内 `mcp__wb_ops__report` 工具 + 沙箱外 `node hooks/report.mjs`，按工具类型细分 分类 行；**v0.13 起默认开**，每次压缩的标记行还内联 `≈N tok → ≈M tok（省 P%）`；**v0.14 起该工具由插件清单声明 MCP 服务器提供，不再走 mod 注册**——原因见「v0.14 变更」）；上下文水位守卫（prompt.submit ≥85% 一行提醒）与压缩保留指示（session.compact instructions，Mod 版 PreCompact）；POLICY 之外的所有工具名（MCP、宿主新增）由谓词 matcher 兜底走通用压缩。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
 
 | 工具 | 策略 |
 |---|---|
@@ -10,7 +10,7 @@ WorkBuddy 的**上下文治理 Mod**（Mod-first）：进程内 `tool.call` 中�
 | Grep / Glob | 两种输入形态都接：**① 宿主原生 `content: string[]`**（v0.11 实测真机形态，裁条目+追加单行说明，**保持数组形态**与宿主序列化同构）；**② JSON 数组文本**（前 K 条 + 计数）。整串原文落盘 `.json` |
 | Read | 按扩展名分档门槛：数据类（.log/.csv/.jsonl/…）>200 行才裁；.json/.md >800 行（≥40KB 的少行 dump 走硬阀）；**源码 <1500 行一律不裁**（读完多半要接着改，中段不能丢）。空洞 ≥20 行给 `回看: Read offset=N limit=M` 指路。宿主自己落的 `<persisted-output>` 不碰 |
 | WebFetch / WebSearch | 标题/链接/加粗行当骨架捞回，正文段省略 |
-| 其余全部工具（③ 兜底） | 谓词 matcher 接住 POLICY 之外的任何工具名（MCP `mcp__*`、宿主新增）：通用压缩，`Exit Code` 非零同样整场透传；预算内零影响，自家报表工具显式排除；`WB_OPS_FALLBACK=0` 单独关 |
+| 其余全部工具（③ 兜底） | 谓词 matcher 接住 POLICY 之外的任何工具名（MCP `mcp__*`、宿主新增）：通用压缩，`Exit Code` 非零同样整场透传；预算内零影响；`WB_OPS_FALLBACK=0` 单独关 |
 
 所有档位共用：**预算按 UTF-8 字节计**（按字符会放过中文越线输出——sana 从 v0.2.2 起吃过同样的亏，单测钉死）；原文 >8MB 或异常形状 → 透传。
 
@@ -27,6 +27,8 @@ WorkBuddy 的**上下文治理 Mod**（Mod-first）：进程内 `tool.call` 中�
 | MCP 工具 | 需要模型主动调用才压缩；自带 schema token；看不见内建工具输出——**不确定** |
 | Skill | 提示词级约定，模型可忽略——**不确定** |
 | **Mod `tool.call`** | 宿主强制执行、进程内、零 spawn、可改写任意工具结果——**确定性拦截** |
+
+注意这张表说的是**压缩**为什么必须是 Mod。v0.14 起「报表」这一个**只读查询**工具改用 MCP：它需要的是「被注册成一个工具」，而不是「拦截别人的输出」——而 mod 的会话级 core 恰好不提供注册能力（见「v0.14 变更」）。载体按职责选，不按主义选。
 
 ## 它如何规避 sana35421/wb-ops 的 5 秒超时事故
 
@@ -145,7 +147,7 @@ token 数是**估算**，公式与宿主 `TokenUtils.estimateTokensRough` 逐字
   分类：shell 5次 ≈7.2k→1.1k tok · jsonlist 2次 ≈3.6k→1.3k tok
 ```
 
-记账 **v0.13 起默认开**（`WB_OPS_STATS=0/off/false/no` 关）：每次压缩多一对小 JSON 读写（约 1KB），会话启动多注册一个 `mcp__wb_ops__report` 工具（schema 约百余 token）。嫌贵就设 `WB_OPS_STATS=0`——标记行里的内联 token 数字不受影响，仍随时可见。
+记账 **v0.13 起默认开**（`WB_OPS_STATS=0/off/false/no` 关）：每次压缩多一对小 JSON 读写（约 1KB）；会话启动多起一个报表 MCP 进程（v0.14 起，`node mcp/server.mjs`，闲置时只占管道不占 CPU），工具 schema 约百余 token。嫌贵就设 `WB_OPS_STATS=0`——标记行里的内联 token 数字不受影响，仍随时可见；MCP 进程与工具是否随该变量消失未做联动（工具在、数据为空时会如实回「还没有记账数据」）。
 
 ## 配置（环境变量，经 `$.env.get` 读取）
 
@@ -206,10 +208,11 @@ bash test/run-acceptance.sh <合法UUID> "验收" WB_OPS_GUARD_PCT=10   # 真机
 ## 已验证 / 未验证
 
 - ✅ **③ 通配兜底的谓词 matcher（2026-11-05 真机闭环）**：`domain_search` 输出 52.1KB → 兜底压缩生效（头部 + `命中关键行` + 尾部，`[+NNNNB]` 单行截断正常）。函数谓词每次事件重评、路由真实生效。
-- ✅ mods 加载（CLI 启动日志 `hooks: tool.call session.start prompt.submit session.compact` 四通道全注册）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复）、报表聚合与渲染（谓词 matcher、坏文件跳过、list 抛错兜底、CLI 真目录聚合）、水位守卫与压缩保留指示（形状候选/阈值边界/关闭零触碰/fail-open）、③ 通配兜底（预算内零影响/非零透传/可关/谓词互斥）、① by-kind 分类账本（kinds 写入/聚合/渲染、无 kinds 老账本兼容）、② 水位数值文件（每轮小写/越线附带 Read 路径/写失败静默/stats-off 仍跟 guard）、④ GUI 安装助手（临时 HOME 装+卸、known/installed 形状、既有市场保留、cache payload 落地）、v0.11 形状诊断通道（只记结构/只记长度/限频/小输出不打扰）、v0.12 水位数据源（嵌套 context 候选/tokens=0 静默/transcript 尾部逆扫/权限探测/目录兜底/可关）、v0.13 token 口径（估算公式/标记行内联省比/记账 tok 字段/默认开/关掉零 IO）——离线 mock API 单测 **94 项全绿**
+- ✅ mods 加载（CLI 启动日志 `hooks: tool.call prompt.submit session.compact` 三通道全注册；v0.14 起 `session.start` 已删——它只为已废弃的 mod 侧工具注册而存在）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复）、水位守卫与压缩保留指示（形状候选/阈值边界/关闭零触碰/fail-open）、③ 通配兜底（预算内零影响/非零透传/可关/谓词互斥）、① by-kind 分类账本（kinds 写入/聚合/渲染、无 kinds 老账本兼容）、② 水位数值文件（每轮小写/越线附带 Read 路径/写失败静默/stats-off 仍跟 guard）、④ GUI 安装助手（临时 HOME 装+卸、known/installed 形状、既有市场保留、cache payload 落地）、v0.11 形状诊断通道（只记结构/只记长度/限频/小输出不打扰）、v0.12 水位数据源（嵌套 context 候选/tokens=0 静默/transcript 尾部逆扫/权限探测/目录兜底/可关）、v0.13 token 口径（估算公式/标记行内联省比/记账 tok 字段/默认开/关掉零 IO）、v0.14 报表 MCP（渲染口径/坏文件跳过/真实子进程 JSON-RPC 握手/清单守卫）——离线 mock API 单测 **94 项全绿**
 - ✅ Grep/Glob 输出形状：从 86 条真实 transcript 确认 = JSON 字符串数组；**2026-11-05 真机再测发现宿主原生形态是 `content: string[]`**（不是 JSON 文本）→ v0.11 已适配（单测钉死：裁条目+单行说明、保持数组形态、预算内零影响、混合类型仍 fail-open）
 - ✅ **真机压缩闭环（2026-11-05 GUI 会话，pid 72880）**：Bash 13.2KB / PowerShell 14.9KB / TaskOutput 30.4KB / Read .log 24.5KB（含 `回看: Read offset=34 limit=180` 空洞指路）/ MCP 兜底 52.1KB / 错误现场 Exit Code 2 完整透传 + `[wb-ops 提示]` 一行 / 预算内零影响 / Read .ts 682 行原样不裁——5 次 spill 落盘 135KB
-- ⚠️ **报表工具注册两处宿主未文档化点**：`$.tool.register` 返回值取 `.tool` 全名（bundle 源码如此，若返形状不符则报表工具不出现，主链路无损）；`$.fs.list` 条目形状未文档化（string/{name} 双兼容 + 抛错即空账本）。开 `WB_OPS_STATS`（v0.13 默认开）后新开会话看工具列表里有无 `mcp__wb_ops__report`。
+- ✅ **报表工具（v0.14 已根治）**：`mcp__wb_ops__report` 现由插件清单 `mcpServers.wb_ops` 声明、宿主 MCP 管理器起进程注册，与 mod core 的能力差异完全解耦。已验：清单 `plugin validate` ✔、安装树入口真实跑通（`initialize` → `tools/list` → `tools/call`，见 `test/probe-installed-mcp.mjs`）、面板版本读的是 plugin.json（打印 0.14.0）。**唯一未验**：GUI 新会话里工具是否出现在清单——需要 `/reload-plugins` 或新开会话，见「v0.14 变更」。
+- ✅ **`${CODEBUDDY_PLUGIN_ROOT}` 在 plugin mcpServers 里会被替换（bundle 反查实锤）**：`enrichWithPluginEnvironment` 对 stdio 声明做 `command`/`args`/`cwd` 三项替换并注入插件环境变量，故 `args: ["${CODEBUDDY_PLUGIN_ROOT}/mcp/server.mjs"]` 是官方支持的写法（内置插件 builtin-calendar / workbuddy-sheetagent 同法）。
 - ✅ **v0.12 水位数据源根因已实锤（2026-11-05 bundle 反查）**：`$.session.usage()` 的真实实现是宿主 `createModsUsageBinding`，返回 `{context:{tokens,window,percent},rateLimits:[]}`（**没有 ` {value:…}` 包装层，之前的猜测作废**）。`window` 由 `resolveSessionContextBudget` 真算（本会话 300000，可信）；`tokens = getCurrentContextUsage(session)?.totalInputTokens ?? 0`，而 mods 持有的 session 上 `getLatestUsageSnapshot` 缺失 ⇒ **恒 0**。数据本身健康：transcript JSONL 每条模型响应都带 `providerData.usage.inputTokens`（实测单调 31737→71198，已含 cache_read），宿主 ACP 的 `usage_update` 也用 `getLatestUsage()?.inputTokens`。**断点在宿主 mods 绑定层，不在数据源**——可向宿主报 issue。
   v0.12 对策：`pickWatermark` 认嵌套 `context.tokens/window`（宿主修好后自动点亮，`tokens=0` 仍静默）；否则走 transcript 尾部采样取 used、window 仍用 `usage().context.window`；读权限探测落 `debug/fsprobe-<sid8>.json`。**待真机确认**：mod 沙箱 `$.fs` 能否读 `<HOME>/.workbuddy/projects/`（若被拒，看 fsprobe 的 err，守卫继续保持静默）。
 - ⚠️ **宿主 `persisted-output` 阈值 ≈8KB 是硬天花板**：超过它宿主先落盘，mod 看不到原文（README 明确"宿主落的 persisted-output 不碰"）。所以 mod 的实际收益上限 = (预算, 8KB) 区间 + 宿主未落盘的其余工具。v0.11 预算降到 4500 正是为了把这块区间吃满。
@@ -236,6 +239,41 @@ bash test/run-acceptance.sh <合法UUID> "验收" WB_OPS_GUARD_PCT=10   # 真机
 - 会话日志 `~/.workbuddy/logs/<date>/<cwd>__<sid>.log` 里可见该行：mod 在**新起的运行时**（新 pid）里生效，老运行时（启用前启动的）不加载 → 启用后要**新开对话**才生效，`/reload-plugins` 不重新引导 mod（`bootstrapFunctionHookMods` 只在启动时调用且被记忆化）。
 
 其余待验证项（①②③④）待新会话里跑：宿主 Bash 大输出会先被自家 `<persisted-output>` 落盘（121KB），mod 的 `tool.call` 中间件看到的是压缩前还是压缩后的结果，需实测确认。
+
+## v0.14 变更（2026-11-05）—— 报表工具改走 MCP：把「换时机」换成「换通道」
+
+**一句话**：v0.13.1 说「GUI 会话拿不到能注册工具的 core，所以多试几个时机」——**这个结论不完整，修法因此无效**。真相是 GUI 会话里**每个钩子拿到的都是同一个不能注册的 core**，换时机永远换不到能用的那一套。改用插件清单声明 MCP 服务器后，工具由宿主 MCP 管理器注册，与 mod core 无关。
+
+### 根因（宿主 bundle 逐段读出来的，不是猜的）
+
+| core | 构造点 | `registerTool` |
+|---|---|---|
+| 应用级 | `bootstrapFunctionHookMods` → `hostBindings` → `createModsCommandToolBindings` | 真实现：`toolManager.register(ModProxyTool)`，探针实测返回 `{tool:"mcp__wbopsprobe__probereport"}` |
+| 会话级 | `createFunctionalHooks` → `makeCore` → `createCoreHandler({...createFunctionalHookBindings(...), registerTool: () => { throw ... }})` | **硬绑 throw**：`Error("Session tool registration is not bound")` |
+
+`createFunctionalHooks` 里那个 `ModsRuntime` 的 core 对 `session.start` / `prompt.submit` / `tool.call` **一视同仁**——所以 v0.13.1 的「双入口重试」在 GUI 下两次都落在同一个 throw 上，`catch {}` 一吞，报表工具整个会话都不存在。CLI 探针当时「两次都成功」是因为 CLI 走的是应用级 core，**验证的路径和出问题的路径不是同一条**。
+
+### 修法
+
+| 文件 | 改动 |
+|---|---|
+| `.codebuddy-plugin/plugin.json` | 新增 `mcpServers.wb_ops = {command:"node", args:["${CODEBUDDY_PLUGIN_ROOT}/mcp/server.mjs"]}`；工具名由 server key 决定 → `mcp__wb_ops__report` |
+| `mcp/server.mjs`（新） | 零依赖 MCP stdio 服务器：`initialize` / `tools/list` / `tools/call` / `ping` / `resources,list` / `prompts,list`；stdout 只走 JSON-RPC，日志一律 stderr |
+| `lib/report-core.mjs`（新） | 聚合 + 渲染的**唯一**实现，MCP 工具与 `hooks/report.mjs` CLI 共用，口径不可能漂 |
+| `hooks/register.ts` | 删掉 `tryRegisterReportTool`、`session.start` 钩子、报表 `tool.call` 处理器、`readStatRows` / `summarizeStats` / `renderSummary`；只留压缩 / 水位 / 压缩保留指示 |
+| `scripts/install-gui.mjs` | payload 目录从 `['.codebuddy-plugin','hooks']` 扩到 `+['lib','mcp']`——漏拷任何一个，工具在宿主侧都起不来 |
+
+### 验收（本机，2026-11-05）
+
+- `plugin validate .` → ✔ Validation passed（含 `mcpServers`）
+- 安装树 `cache/wb-ops-local/wb-ops/0.14.0/{.codebuddy-plugin,hooks,lib,mcp}` 齐备，旧 `0.13.1` 已清
+- `node test/probe-installed-mcp.mjs` → `serverInfo {name:"wb-ops-report", version:"0.14.0"}` / `tools/list: report` / `tools/call isError=false` 返回真实报表（`压缩 28 次 · 省 ≈65.5k tok / 258.1KB (72.9%)`）/ stdout 脏行 0
+- 单测 94 项全绿，其中 MCP 全链路用例是**真子进程**握手（不是 mock）
+- CLI 启动日志确认 mod 钩子已收敛为 `tool.call prompt.submit session.compact`
+
+### 你要做的最后一步
+
+**新开一个对话**（新运行时才会重新装配插件；`/reload-plugins` 对 mod 的 `bootstrapFunctionHookMods` 无效，MCP 是否随之重载未验）。新会话里 `mcp__wb_ops__report` 应出现在工具清单；问我「调一下 wb-ops 报表」即可验证。
 
 ## v0.12 变更（2026-11-05）
 
