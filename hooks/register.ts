@@ -220,6 +220,33 @@ export function byteLen(s: string): number {
   return n;
 }
 
+/** token 估算：与宿主 `TokenUtils.estimateTokensRough` 逐字同公式（shared.cjs：
+ *  `ceil(CJK/1.8) + ceil(其余字符/4)`）——报表/标记的口径与 wb 自身计数同源，不另立一套。
+ *  纯展示用途，不参与任何压缩/透传决策（决策仍按字节，字节是保守上界）。 */
+export function estTokens(s: string): number {
+  let cjk = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0x4e00 && c <= 0x9fa5) cjk++;
+  }
+  return Math.ceil(cjk / 1.8) + Math.ceil((s.length - cjk) / 4);
+}
+
+/** 人读体量：13.4KB（原来直接甩 13200B，看不出省没省）。 */
+export function fmtBytes(n: number): string {
+  return n >= 1048576 ? (n / 1048576).toFixed(2) + 'MB' : n >= 1024 ? (n / 1024).toFixed(1) + 'KB' : n + 'B';
+}
+export function fmtTok(n: number): string {
+  return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+}
+
+/** 标记行正文（头段之后那一行）：一行给出原文/压缩后的体量与 token 估算，模型与人都一眼看到省了多少。 */
+function markerNote(head: string, rawBytes: number, beforeTok: number, afterTok: number, spillPath: string | null): string {
+  const pct = beforeTok > 0 ? Math.round((Math.max(0, beforeTok - afterTok) / beforeTok) * 100) : 0;
+  const keep = spillPath ? '落盘 ' + spillPath : '未落盘（原文过大或写入失败，可重跑命令）';
+  return `${MARKER} ${head} · 原文 ${fmtBytes(rawBytes)}≈${fmtTok(beforeTok)} tok → ≈${fmtTok(afterTok)} tok（省 ${pct}%） · ${keep}`;
+}
+
 /** UTF-8 安全的字节前缀（代理对不被劈开）。 */
 export function u8Prefix(s: string, maxBytes: number): string {
   let n = 0, i = 0;
@@ -410,10 +437,10 @@ export function compress(
   }
 
   const dropped = Math.max(0, total - headKeep - tailKeep - keyIdx.length);
-  const note = `${MARKER} 已省略 ${dropped} 行 · 原文 ${bytes}B → ${spillPath ? '落盘 ' + spillPath : '未落盘（原文过大或写入失败，可重跑命令）'}${hint}`;
   const parts: string[] = [];
   for (let i = 0; i < headKeep; i++) parts.push(truncLine(lines[i]));
-  parts.push(note);
+  const noteAt = parts.length;               // 占位：标记要写「压缩后 tok」，先拼正文再回填
+  parts.push('');                            // 空串只差一个换行，≈ 值不受影响
   if (keyIdx.length) {
     parts.push(`--- 命中关键行 (${keyIdx.length}) ---`);
     for (const i of keyIdx) parts.push(truncLine(lines[i]));
@@ -421,6 +448,8 @@ export function compress(
   parts.push('--- 尾部 ---');
   for (let i = total - tailKeep; i < total; i++) parts.push(truncLine(lines[i]));
 
+  // 先拼正文 → 量压缩后体量 → 回填标记（标记自身约 20 tok 不计，≈ 口径：省量宁少勿多）
+  parts[noteAt] = markerNote(`已省略 ${dropped} 行`, bytes, estTokens(raw), estTokens(parts.join('\n')), spillPath) + hint;
   let text = parts.join('\n');
   if (byteLen(text) > budget + MARKER_RESERVE) text = u8Prefix(text, budget + MARKER_RESERVE) + `\n${MARKER} …截断`;
   return { text, dropped };
@@ -436,7 +465,10 @@ export function trimList(items: string[], budget: number, spillPath: string | nu
     used += c; k++;
   }
   const kept = items.slice(0, k).map(truncLine);
-  const note = `${MARKER} 共 ${items.length} 条，已省略 ${items.length - k} 条 · 原文 ${rawBytes}B → ${spillPath ? '落盘 ' + spillPath : '未落盘（原文过大或写入失败，可重跑命令）'}`;
+  // 标记自身约 20 tok 不计入 afterTok（≈ 口径：省量宁少勿多）
+  const beforeTok = items.reduce((a, it) => a + estTokens(it), 0);
+  const afterTok = kept.reduce((a, it) => a + estTokens(it), 0);
+  const note = markerNote(`共 ${items.length} 条，已省略 ${items.length - k} 条`, rawBytes, beforeTok, afterTok, spillPath);
   return { kept, note, dropped: items.length - k };
 }
 
@@ -471,7 +503,8 @@ async function readCfg($: any): Promise<Cfg> {
     budget: budget > 512 ? budget : DEFAULT_BUDGET,
     deadlineMs: deadline >= 0 ? deadline : DEFAULT_DEADLINE_MS,
     home,
-    stats: /^(1|true|on|yes)$/i.test((await g('WB_OPS_STATS')).trim()),
+    // v0.13：默认开——"看到省了多少"不该先要用户配环境变量；WB_OPS_STATS=0/off/false/no 可关。
+    stats: !/^(0|off|false|no)$/i.test((await g('WB_OPS_STATS')).trim()),
     hints: !/^(0|off|false|no)$/i.test((await g('WB_OPS_HINTS')).trim()),
     guard: !/^(0|off|false|no)$/i.test((await g('WB_OPS_GUARD')).trim()),
     guardPct: gpct > 0 && gpct < 100 ? gpct : DEFAULT_GUARD_PCT,
@@ -519,9 +552,10 @@ async function spillRaw($: any, e: any, text: string, home: string, sid: string,
   }
 }
 
-/** 记账（WB_OPS_STATS=1 才开）：每会话一个小 JSON 计数器，整读整写小文件，不做无界追写。
+/** 记账（WB_OPS_STATS 开，v0.13 起默认开）：每会话一个小 JSON 计数器，整读整写小文件，不做无界追写。
+ *  字节是老口径，tok* 是 v0.13 新增的 token 口径（与宿主同公式估算）。
  *  任何失败静默——纯观测件，绝不反噬主流程。 */
-async function recordStats($: any, home: string, sid: string, tool: string, before: number, after: number): Promise<void> {
+async function recordStats($: any, home: string, sid: string, tool: string, before: number, after: number, beforeTok: number, afterTok: number): Promise<void> {
   try {
     const path = `${home.replace(/\\/g, '/')}/.workbuddy/wb-ops/stats/${sid}.json`;
     let cur: Record<string, any> = { calls: 0, before: 0, after: 0, kinds: {} };
@@ -533,28 +567,36 @@ async function recordStats($: any, home: string, sid: string, tool: string, befo
     cur.calls = (cur.calls || 0) + 1;
     cur.before = (cur.before || 0) + before;
     cur.after = (cur.after || 0) + after;
+    cur.tokBefore = (cur.tokBefore || 0) + beforeTok;
+    cur.tokAfter = (cur.tokAfter || 0) + afterTok;
     cur.kinds = cur.kinds || {}; // ① 按类细分（对齐 sana 明细账本的口径维度；老文件无此字段自动补上）
-    const kk = cur.kinds[tool] = cur.kinds[tool] || { calls: 0, before: 0, after: 0 };
+    const kk = cur.kinds[tool] = cur.kinds[tool] || { calls: 0, before: 0, after: 0, tokBefore: 0, tokAfter: 0 };
     kk.calls++; kk.before += before; kk.after += after;
+    kk.tokBefore = (kk.tokBefore || 0) + beforeTok; kk.tokAfter = (kk.tokAfter || 0) + afterTok;
     await $.fs.write(path, JSON.stringify({ ...cur, tool, ts: new Date().toISOString() }));
   } catch { /* 记账失败不影响主流程 */ }
 }
 
 // ------------------------------------------------------------------ report (#3)
 
-export interface StatRow { file: string; calls: number; before: number; after: number; tool?: string; ts?: string; kinds?: Record<string, { calls: number; before: number; after: number }> }
+export interface StatKind { calls: number; before: number; after: number; tokBefore?: number; tokAfter?: number }
+export interface StatRow { file: string; calls: number; before: number; after: number; tokBefore?: number; tokAfter?: number; tool?: string; ts?: string; kinds?: Record<string, StatKind> }
+export interface StatAgg { calls: number; before: number; after: number; tokBefore: number; tokAfter: number; kinds: Record<string, StatKind> }
 
-export function summarizeStats(rows: StatRow[]): { calls: number; before: number; after: number; kinds: Record<string, { calls: number; before: number; after: number }> } {
-  let calls = 0, before = 0, after = 0;
-  const kinds: Record<string, { calls: number; before: number; after: number }> = {};
+export function summarizeStats(rows: StatRow[]): StatAgg {
+  let calls = 0, before = 0, after = 0, tokBefore = 0, tokAfter = 0;
+  const kinds: Record<string, StatKind> = {};
   for (const r of rows) {
     calls += r.calls || 0; before += r.before || 0; after += r.after || 0;
+    tokBefore += r.tokBefore || 0; tokAfter += r.tokAfter || 0;
     for (const [k, v] of Object.entries(r.kinds || {})) {
-      const t = kinds[k] = kinds[k] || { calls: 0, before: 0, after: 0 };
+      const t = kinds[k] = kinds[k] || { calls: 0, before: 0, after: 0, tokBefore: 0, tokAfter: 0 };
       t.calls += v.calls || 0; t.before += v.before || 0; t.after += v.after || 0;
+      t.tokBefore = (t.tokBefore || 0) + (v.tokBefore || 0);
+      t.tokAfter = (t.tokAfter || 0) + (v.tokAfter || 0);
     }
   }
-  return { calls, before, after, kinds };
+  return { calls, before, after, tokBefore, tokAfter, kinds };
 }
 
 export function renderSummary(rows: StatRow[]): string {
@@ -562,14 +604,19 @@ export function renderSummary(rows: StatRow[]): string {
   if (!agg.calls) return '[wb-ops] 还没有记账数据（需要 WB_OPS_STATS=1 且发生过压缩）';
   const saved = agg.before - agg.after;
   const pct = agg.before ? ((saved / agg.before) * 100).toFixed(1) : '0.0';
-  const kb = (n: number) => (n >= 1048576 ? (n / 1048576).toFixed(2) + 'MB' : (n / 1024).toFixed(1) + 'KB');
+  const kb = fmtBytes;
   const kindList = Object.entries(agg.kinds).sort((a, b) => b[1].before - a[1].before);
+  const kindFmt = ([k, v]: [string, StatKind]) => v.tokBefore
+    ? `${k} ${v.calls}次 ≈${fmtTok(v.tokBefore)}→${fmtTok(v.tokAfter || 0)} tok`
+    : `${k} ${v.calls}次 ${kb(v.before)}→${kb(v.after)}`;
   const lines = [
-    `[wb-ops 报表] 压缩 ${agg.calls} 次 · 原文 ${kb(agg.before)} → 压缩后 ${kb(agg.after)} · 省 ${kb(saved)} (${pct}%) · 记账会话 ${rows.length} 个`,
-    ...(kindList.length ? ['  分类：' + kindList.map(([k, v]) => `${k} ${v.calls}次 ${kb(v.before)}→${kb(v.after)}`).join(' · ')] : []),
+    agg.tokBefore > 0
+      ? `[wb-ops 报表] 压缩 ${agg.calls} 次 · 省 ≈${fmtTok(agg.tokBefore - agg.tokAfter)} tok / ${kb(saved)} (${pct}%) · 原文 ${kb(agg.before)}≈${fmtTok(agg.tokBefore)} tok → 压缩后 ${kb(agg.after)}≈${fmtTok(agg.tokAfter)} tok · 记账会话 ${rows.length} 个`
+      : `[wb-ops 报表] 压缩 ${agg.calls} 次 · 原文 ${kb(agg.before)} → 压缩后 ${kb(agg.after)} · 省 ${kb(saved)} (${pct}%) · 记账会话 ${rows.length} 个`,
+    ...(kindList.length ? ['  分类：' + kindList.map(kindFmt).join(' · ')] : []),
     ...rows.sort((a, b) => (b.ts || '').localeCompare(a.ts || '')).slice(0, 12)
       .map(r => `  ${r.file.replace(/\.json$/, '')}  ${r.calls} 次  ${kb(r.before)}→${kb(r.after)}  最后: ${r.tool || '?'} ${r.ts ? r.ts.slice(0, 10) : ''}`),
-    '  口径：只计本 Mod 实际改写的输出；被裁原文在 ~/.workbuddy/wb-ops/spill/ 可回查。',
+    '  口径：token 为估算（与宿主同公式 ceil(中文/1.8)+ceil(其余/4)）；只计本 Mod 实际改写的输出，被裁原文在 ~/.workbuddy/wb-ops/spill/ 可回查。',
   ];
   return lines.join('\n');
 }
@@ -764,7 +811,7 @@ async function readStatRows($: any, dir: string): Promise<StatRow[]> {
       const txt = typeof v === 'string' ? v : v && typeof (v as { text?: unknown }).text === 'string' ? (v as { text: string }).text : '';
       if (!txt) continue;
       const j = JSON.parse(txt) as Record<string, number & string & { kinds?: StatRow['kinds'] }>;
-      rows.push({ file: name, calls: j.calls || 0, before: j.before || 0, after: j.after || 0, tool: j.tool, ts: j.ts, kinds: j.kinds });
+      rows.push({ file: name, calls: j.calls || 0, before: j.before || 0, after: j.after || 0, tokBefore: j.tokBefore || 0, tokAfter: j.tokAfter || 0, tool: j.tool, ts: j.ts, kinds: j.kinds });
     } catch { /* 单文件坏不影响整体 */ }
   }
   return rows;
@@ -845,11 +892,11 @@ function makeHandler(kind: string) {
             // 与原生同构；改成字符串会撞上渲染器对 content 类型的假设）。
             const { kept, note, dropped } = trimList(listItems, cfg.budget, path, bytes);
             const arr = [...kept, note];
-            if (cfg.stats && cfg.home) await recordStats($, cfg.home, sid, kind, bytes, byteLen(arr.join('\n')));
+            if (cfg.stats && cfg.home) await recordStats($, cfg.home, sid, kind, bytes, byteLen(arr.join('\n')), estTokens(t.raw), estTokens(arr.join('\n')));
             return { ...r, result: t.sink.put(arr) };
           }
           const out = compressList(listItems, cfg.budget, path, bytes);
-          if (cfg.stats && cfg.home) await recordStats($, cfg.home, sid, kind, bytes, byteLen(out.text));
+          if (cfg.stats && cfg.home) await recordStats($, cfg.home, sid, kind, bytes, byteLen(out.text), estTokens(t.raw), estTokens(out.text));
           return { ...r, result: t.sink.put(out.text) };
         }
       }
@@ -862,7 +909,7 @@ function makeHandler(kind: string) {
       const path = await spillRaw($, e, t.raw, cfg.home, sid, ext);
       const out = compress(t.raw, cfg.budget, cfg.deadlineMs, path, opts);
       if (!out) return r;                    // 放弃压缩（门槛/行数门/软超时）
-      if (cfg.stats && cfg.home) await recordStats($, cfg.home, sid, kind, bytes, byteLen(out.text));
+      if (cfg.stats && cfg.home) await recordStats($, cfg.home, sid, kind, bytes, byteLen(out.text), estTokens(t.raw), estTokens(out.text));
       return { ...r, result: t.sink.put(out.text) };
     } catch {
       return r;                              // fail-open：任何问题都不影响工具结果
