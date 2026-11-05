@@ -2,7 +2,7 @@
 
 WorkBuddy 的**上下文治理 Mod**（Mod-first）：进程内 `tool.call` 中间件，在工具结果进入模型上下文之前做确定性压缩，原文落盘可回查。错误输出**永不压缩**。目标只有一个：**降本增效——让进入上下文的每一份 token 都携带高价值信息**。
 
-当前版本 v0.8 覆盖 **8 个高频出口 + 通配兜底**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（JSON 数组识别）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）；开启记账后提供省量报表（会话内 `mcp__wb_ops__report` 工具 + 沙箱外 `node hooks/report.mjs`）；上下文水位守卫（prompt.submit ≥85% 一行提醒）与压缩保留指示（session.compact instructions，Mod 版 PreCompact）；POLICY 之外的所有工具名（MCP、宿主新增）由谓词 matcher 兜底走通用压缩。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
+当前版本 v0.9 覆盖 **8 个高频出口 + 通配兜底**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（JSON 数组识别）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）；开启记账后提供省量报表（会话内 `mcp__wb_ops__report` 工具 + 沙箱外 `node hooks/report.mjs`，按工具类型细分 分类 行）；上下文水位守卫（prompt.submit ≥85% 一行提醒）与压缩保留指示（session.compact instructions，Mod 版 PreCompact）；POLICY 之外的所有工具名（MCP、宿主新增）由谓词 matcher 兜底走通用压缩。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
 
 | 工具 | 策略 |
 |---|---|
@@ -83,7 +83,7 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" --
 | `WB_OPS` | 开 | `0/off/false/no` 全局关闭 |
 | `WB_OPS_BUDGET` | 8000 | 压缩后文本字节上限（>512 才生效）；与 sana 同名同义，共存时一个值管两边 |
 | `WB_OPS_DEADLINE_MS` | 100 | 压缩自设软超时；`0` 等效禁用压缩 |
-| `WB_OPS_STATS` | 关 | `1/on/true` 开启省量记账：每次成功压缩更新 `~/.workbuddy/wb-ops/stats/<sid8>.json`（整读整写小计数器，非无界追写；挂了不影响压缩，有单测钉死）。开启后会话启动时注册 `mcp__wb_ops__report` 报表工具（不开不注册，不占 schema token）；沙箱外可跑 `node hooks/report.mjs` |
+| `WB_OPS_STATS` | 关 | `1/on/true` 开启省量记账：每次成功压缩更新 `~/.workbuddy/wb-ops/stats/<sid8>.json`（整读整写小计数器，含按工具类型细分的 `kinds` 字段，非无界追写；挂了不影响压缩，有单测钉死）。开启后会话启动时注册 `mcp__wb_ops__report` 报表工具（不开不注册，不占 schema token）；沙箱外可跑 `node hooks/report.mjs` |
 | `WB_OPS_HINTS` | 开 | `0/off/false/no` 关闭 shell 失败现场的 nextAction 提示（提示只加一行，不占压缩预算） |
 | `WB_OPS_GUARD` | 开 | `0/off/false/no` 同时关闭 #4 水位守卫（prompt.submit 提醒）与 #5 压缩保留指示（session.compact instructions）。守卫每轮仅一次 `$.session.usage()` 进程内读取，**无子进程、无 transcript 扫描**——sana 5s 事故的三个根因全不沾 |
 | `WB_OPS_FALLBACK` | 开 | `0/off/false/no` 关闭 ③ 通配兜底（只保留 8 个白名单出口） |
@@ -100,7 +100,7 @@ node --test test/register.test.ts   # 61 项，全绿（需 Node ≥22.6 的 --e
 ## 已验证 / 未验证
 
 - ⚠️ **③ 通配兜底的谓词 matcher**：文档「深匹配」节声明支持函数谓词、每次事件重评；离线单测钉死互斥逻辑，宿主实际路由需 /login 后用一个 MCP 工具大输出看是否带标记。
-- ✅ mods 加载（CLI 启动日志 `hooks: tool.call session.start prompt.submit session.compact` 四通道全注册）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复）、报表聚合与渲染（谓词 matcher、坏文件跳过、list 抛错兜底、CLI 真目录聚合）、水位守卫与压缩保留指示（形状候选/阈值边界/关闭零触碰/fail-open）、③ 通配兜底（预算内零影响/非零透传/可关/谓词互斥）、② 水位数值文件（每轮小写/越线附带 Read 路径/写失败静默；离线 mock API 单测 61 项）
+- ✅ mods 加载（CLI 启动日志 `hooks: tool.call session.start prompt.submit session.compact` 四通道全注册）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复）、报表聚合与渲染（谓词 matcher、坏文件跳过、list 抛错兜底、CLI 真目录聚合）、水位守卫与压缩保留指示（形状候选/阈值边界/关闭零触碰/fail-open）、③ 通配兜底（预算内零影响/非零透传/可关/谓词互斥）、① by-kind 分类账本（kinds 写入/聚合/渲染、无 kinds 老账本兼容）、② 水位数值文件（每轮小写/越线附带 Read 路径/写失败静默）——离线 mock API 单测 61 项
 - ✅ Grep/Glob 输出形状：从 86 条真实 transcript 确认 = JSON 字符串数组
 - ⚠️ **报表工具注册两处宿主未文档化点**：`$.tool.register` 返回值取 `.tool` 全名（bundle 源码如此，若返形状不符则报表工具不出现，主链路无损）；`$.fs.list` 条目形状未文档化（string/{name} 双兼容 + 抛错即空账本）。`/login` 后开 `WB_OPS_STATS=1` 看工具列表里有无 `mcp__wb_ops__report`。
 - ⚠️ **`$.session.usage()` 真实返回形状**（bundle 中存在 `{used,size}` 与 `{inputTokens,contextWindow}` 两种构造，代码收 4+3 字段候选，判不出静默）与 `prompt.submit` 返回 `{text,context}` 的宿主合并行为——`/login` 后把上下文灌到 >85% 看是否出现 `[wb-ops 水位]` 行；`session.compact` instructions 合并同理需一次真实 auto-compact 验证。

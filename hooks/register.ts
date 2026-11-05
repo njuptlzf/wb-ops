@@ -412,27 +412,37 @@ async function spillRaw($: any, e: any, text: string, home: string, sid: string,
 async function recordStats($: any, home: string, sid: string, tool: string, before: number, after: number): Promise<void> {
   try {
     const path = `${home.replace(/\\/g, '/')}/.workbuddy/wb-ops/stats/${sid}.json`;
-    let cur: Record<string, number> = { calls: 0, before: 0, after: 0 };
+    let cur: Record<string, any> = { calls: 0, before: 0, after: 0, kinds: {} };
     try {
       const v = await $.fs.read(path);
       const txt = typeof v === 'string' ? v : v && typeof (v as { text?: unknown }).text === 'string' ? (v as { text: string }).text : '';
-      if (txt) cur = { ...cur, ...(JSON.parse(txt) as Record<string, number>) };
+      if (txt) cur = { ...cur, ...(JSON.parse(txt) as Record<string, any>) };
     } catch { /* 首次 */ }
     cur.calls = (cur.calls || 0) + 1;
     cur.before = (cur.before || 0) + before;
     cur.after = (cur.after || 0) + after;
+    cur.kinds = cur.kinds || {}; // ① 按类细分（对齐 sana 明细账本的口径维度；老文件无此字段自动补上）
+    const kk = cur.kinds[tool] = cur.kinds[tool] || { calls: 0, before: 0, after: 0 };
+    kk.calls++; kk.before += before; kk.after += after;
     await $.fs.write(path, JSON.stringify({ ...cur, tool, ts: new Date().toISOString() }));
   } catch { /* 记账失败不影响主流程 */ }
 }
 
 // ------------------------------------------------------------------ report (#3)
 
-export interface StatRow { file: string; calls: number; before: number; after: number; tool?: string; ts?: string }
+export interface StatRow { file: string; calls: number; before: number; after: number; tool?: string; ts?: string; kinds?: Record<string, { calls: number; before: number; after: number }> }
 
-export function summarizeStats(rows: StatRow[]): { calls: number; before: number; after: number } {
+export function summarizeStats(rows: StatRow[]): { calls: number; before: number; after: number; kinds: Record<string, { calls: number; before: number; after: number }> } {
   let calls = 0, before = 0, after = 0;
-  for (const r of rows) { calls += r.calls || 0; before += r.before || 0; after += r.after || 0; }
-  return { calls, before, after };
+  const kinds: Record<string, { calls: number; before: number; after: number }> = {};
+  for (const r of rows) {
+    calls += r.calls || 0; before += r.before || 0; after += r.after || 0;
+    for (const [k, v] of Object.entries(r.kinds || {})) {
+      const t = kinds[k] = kinds[k] || { calls: 0, before: 0, after: 0 };
+      t.calls += v.calls || 0; t.before += v.before || 0; t.after += v.after || 0;
+    }
+  }
+  return { calls, before, after, kinds };
 }
 
 export function renderSummary(rows: StatRow[]): string {
@@ -441,8 +451,10 @@ export function renderSummary(rows: StatRow[]): string {
   const saved = agg.before - agg.after;
   const pct = agg.before ? ((saved / agg.before) * 100).toFixed(1) : '0.0';
   const kb = (n: number) => (n >= 1048576 ? (n / 1048576).toFixed(2) + 'MB' : (n / 1024).toFixed(1) + 'KB');
+  const kindList = Object.entries(agg.kinds).sort((a, b) => b[1].before - a[1].before);
   const lines = [
     `[wb-ops 报表] 压缩 ${agg.calls} 次 · 原文 ${kb(agg.before)} → 压缩后 ${kb(agg.after)} · 省 ${kb(saved)} (${pct}%) · 记账会话 ${rows.length} 个`,
+    ...(kindList.length ? ['  分类：' + kindList.map(([k, v]) => `${k} ${v.calls}次 ${kb(v.before)}→${kb(v.after)}`).join(' · ')] : []),
     ...rows.sort((a, b) => (b.ts || '').localeCompare(a.ts || '')).slice(0, 12)
       .map(r => `  ${r.file.replace(/\.json$/, '')}  ${r.calls} 次  ${kb(r.before)}→${kb(r.after)}  最后: ${r.tool || '?'} ${r.ts ? r.ts.slice(0, 10) : ''}`),
     '  口径：只计本 Mod 实际改写的输出；被裁原文在 ~/.workbuddy/wb-ops/spill/ 可回查。',
@@ -499,8 +511,8 @@ async function readStatRows($: any, dir: string): Promise<StatRow[]> {
       const v = await $.fs.read(`${dir}/${name}`);
       const txt = typeof v === 'string' ? v : v && typeof (v as { text?: unknown }).text === 'string' ? (v as { text: string }).text : '';
       if (!txt) continue;
-      const j = JSON.parse(txt) as Record<string, number & string>;
-      rows.push({ file: name, calls: j.calls || 0, before: j.before || 0, after: j.after || 0, tool: j.tool, ts: j.ts });
+      const j = JSON.parse(txt) as Record<string, number & string & { kinds?: StatRow['kinds'] }>;
+      rows.push({ file: name, calls: j.calls || 0, before: j.before || 0, after: j.after || 0, tool: j.tool, ts: j.ts, kinds: j.kinds });
     } catch { /* 单文件坏不影响整体 */ }
   }
   return rows;

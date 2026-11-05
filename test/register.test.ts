@@ -416,6 +416,7 @@ test('WB_OPS_STATS=1：写会话计数器，省量可查', async () => {
   assert.equal(j.calls, 1);
   assert.ok(j.before > 100000 && j.after < 9500 && j.before > 3 * j.after, `before=${j.before} after=${j.after}`);
   assert.equal(j.tool, 'shell');
+  assert.deepEqual(j.kinds.shell, { calls: 1, before: j.before, after: j.after }, '① by-kind 细分同口径');
 });
 
 test('记账读失败不影响压缩（fail-open）', async () => {
@@ -475,11 +476,12 @@ test('report 工具：读目录聚合渲染（谓词命中、next 不可达）',
   const h = harness({
     env: { ...HOME, WB_OPS_STATS: '1' },
     list: ['aaaa1111.json', 'bad.json', 'notes.txt'],
-    files: { [`${dir}/aaaa1111.json`]: JSON.stringify({ calls: 3, before: 30000, after: 5000, tool: 'jsonlist', ts: '2026-11-04T09:00:00.000Z' }) },
+    files: { [`${dir}/aaaa1111.json`]: JSON.stringify({ calls: 3, before: 30000, after: 5000, tool: 'jsonlist', ts: '2026-11-04T09:00:00.000Z', kinds: { jsonlist: { calls: 2, before: 24000, after: 3200 }, shell: { calls: 1, before: 6000, after: 1800 } } }) },
   });
   await h.fireSessionStart(); // 注册 report → 谓词命中自己、兜底排除
   const { out } = await h.callReport();
   assert.ok(out.result.includes('压缩 3 次'));
+  assert.match(out.result, /分类：jsonlist 2次 23\.4KB→3\.1KB · shell 1次 5\.9KB→1\.8KB/);
   assert.ok(out.result.includes('jsonlist'), '最后 tool 字段透出');
   assert.ok(!out.result.includes('bad'), '坏 JSON 行被跳过');
 });
