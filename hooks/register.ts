@@ -465,10 +465,16 @@ export function pickWatermark(u: unknown): { used: number; size: number } | null
   return { used, size };
 }
 
-export function guardNote(w: { used: number; size: number }, pct: number): string | null {
+/** ② 水位数值行：sana ctx-guard 的 budget/<sid8>.num 等价物——模型可 Read 的纯文本余量。 */
+export function watermarkLine(w: { used: number; size: number }): string {
+  const pct = ((w.used / w.size) * 100).toFixed(1);
+  return `${w.size - w.used}\n已用 ${w.used}/${w.size} tok（${pct}%）· ${new Date().toISOString()}`;
+}
+
+export function guardNote(w: { used: number; size: number }, pct: number, wmPath?: string): string | null {
   const p = (w.used / w.size) * 100;
   if (p < pct) return null;
-  return `[wb-ops 水位] 上下文约 ${p.toFixed(0)}%（${w.used}/${w.size} tok）。接近上限时宿主将有损压缩；建议本轮起：大输出命令自带 head/过滤、探索合并成批、避免整读大文件。wb-ops 已把每次越线输出压回预算内。`;
+  return `[wb-ops 水位] 上下文约 ${p.toFixed(0)}%（${w.used}/${w.size} tok）。接近上限时宿主将有损压缩；建议本轮起：大输出命令自带 head/过滤、探索合并成批、避免整读大文件。wb-ops 已把每次越线输出压回预算内。${wmPath ? ` 余量速查：Read ${wmPath}` : ''}`;
 }
 
 export const COMPACT_RETENTION = '[wb-ops] 压缩保留优先级：错误/警告行原文、文件路径+行号、[wb-ops] 标记及其落盘路径、最近 3 条用户指令原文；其余可安全摘要。';
@@ -627,7 +633,18 @@ export function register(on: On, _options?: unknown): void {
       const cfg = await readCfg($);
       if (cfg.enabled && cfg.guard) {
         const w = pickWatermark(await $.session.usage());
-        const note = w ? guardNote(w, cfg.guardPct) : null;
+        let note: string | null = null;
+        if (w) {
+          // ② 每轮把余量写进 <sid8>.num（几十字节小文件，进程内 fs）——越线提醒之外让模型可主动查
+          let wmPath: string | undefined;
+          try {
+            if (cfg.home) {
+              wmPath = `${cfg.home.replace(/\\/g, '/')}/.workbuddy/wb-ops/watermark/${await getSid8($)}.num`;
+              await $.fs.write(wmPath, watermarkLine(w));
+            }
+          } catch { wmPath = undefined; }
+          note = guardNote(w, cfg.guardPct, wmPath);
+        }
         if (note) {
           const r = await next(e);
           const text = r && typeof r.text === 'string' ? r.text : String(e?.text ?? '');
