@@ -6,8 +6,9 @@
 |---|---|---|---|
 | v0.12.0 | 2026-11-05 | ✅ 三项全过（沙箱读权限 / 水位提醒 / auto-compact 合并） | `cce1dd1` |
 | v0.12.1 | 2026-11-05 | ✅ 大文件降级（22MB transcript 不再失守） | `802458a` |
+| v0.13 | 2026-11-05 | ⏳ 待真机：token 指标（标记行内联 `≈N tok → ≈M tok（省 P%）` + 报表 tok 口径） | — |
 
-离线单测：**91/91 全绿**（`node --test test/register.test.ts`）。宿主校验器：`plugin validate` ✔、`plugin list` → `enabled`。
+离线单测：**94/94 全绿**（`node --test test/register.test.ts`）。宿主校验器：`plugin validate` ✔、`plugin list` → `enabled`。
 
 ---
 
