@@ -35,6 +35,7 @@ const DEFAULT_DEADLINE_MS = 100;             // 压缩自设软超时；超时�
 const DEFAULT_GUARD_PCT = 85;                // 水位守卫阈值（%. usage 形状判不出即静默）
 const MAX_SPILL_CHARS = 4_000_000;           // 落盘写入门槛：超过不写（唯一的同步 IO 必须封顶）
 const MAX_INPUT_BYTES = 8_000_000;           // 超大输入一律透传（split 本身都不做）
+const TX_TAIL_CHARS = 4_000_000;             // transcript 超大时只解析尾部这么多字符（≈尾部 40 行富余）
 const LINE_MAX_BYTES = 1000;                 // 单行展示上限（防 minified 巨行吃满预算；sana MAX_LINE_BYTES）
 const KEY_MAX_LINES = 40;                    // 中段捞回上限，超出均匀抽样（sana MAX_KEY_LINES）
 const KEY_POOL_MAX = 4000;                   // 命中爆炸护栏：池满即用已有部分
@@ -636,16 +637,21 @@ export function projectSlug(cwd: string): string {
   return p.replace(/^([A-Za-z]):/, (_m, d: string) => d.toLowerCase()).replace(/\//g, '-');
 }
 
-/** JSONL 尾部逆扫最后一条模型响应的 inputTokens（已含 cache_read，不要再叠加），最多回看 40 行。 */
-export function lastInputTokens(txt: string): number | undefined {
+/**
+ * JSONL 尾部逆扫最后一条模型响应的 inputTokens（已含 cache_read，不要再叠加），最多回看 40 行。
+ * from 允许只传文件尾部的一段（超大文件的降级路径）：靠前的行被丢弃不影响结论。
+ */
+export function lastInputTokens(txt: string, from = 0): number | undefined {
   const SCAN_LINES = 40, LINE_CAP = 2_000_000;
   let end = txt.length;
   while (end > 0 && (txt[end - 1] === '\n' || txt[end - 1] === '\r')) end--;
-  for (let seen = 0; end > 0 && seen < SCAN_LINES; seen++) {
+  for (let seen = 0; end > from && seen < SCAN_LINES; seen++) {
     let start = txt.lastIndexOf('\n', end - 1);
     start = start < 0 ? 0 : start + 1;
+    if (start < from) start = from;                 // 越过分段起点
     const line = txt.slice(start, end);
     end = start > 0 ? start - 1 : 0;
+    if (!line) continue;
     if (line.length > LINE_CAP) continue;
     if (line.indexOf('inputTokens') < 0 && line.indexOf('input_tokens') < 0) continue;
     try {
@@ -657,7 +663,7 @@ export function lastInputTokens(txt: string): number | undefined {
   return undefined;
 }
 
-export interface TxProbe { used?: number; bytes?: number; path?: string; err?: string; }
+export interface TxProbe { used?: number; bytes?: number; path?: string; err?: string; truncated?: boolean; }
 let txPathCache: { sid: string; base: string; path: string } | null = null;   // 命中后下轮直读，不再列目录
 
 /**
@@ -665,6 +671,11 @@ let txPathCache: { sid: string; base: string; path: string } | null = null;   //
  * 只发生在 prompt.submit（每轮用户提交一次），不是 tool.call 热路径；任何失败都返回 err 而不抛。
  * 路径推导失败时列一次目录找 <sid>.jsonl（兼容宿主改 slug 规则 / 自定义 projects 目录）。
  * 绝不把正文写进 debug：只回传 used/bytes/path/err。
+ *
+ * v0.12.1 超大文件降级：宿主 transcript 只增不减，长会话实测可达 20MB+（见 MEMORY）。
+ * 旧实现对 >8MB 直接判 err → 长会话 fallback 永久失效（usage 恰好在 compact 后短暂归零时）。
+ * 现改为：仍读全文（实测 22MB 约 115ms，可接受），但只解析尾部若干行；
+ * 且用 fs.stat 预判体积，超限时在 debug 里标 truncated —— 不再因为体积而整条链路失守。
  */
 export async function probeTranscript($: any, home: string, sid: string, cwd: string, projectsDir?: string): Promise<TxProbe> {
   if (!home) return { err: 'no home' };
@@ -673,11 +684,24 @@ export async function probeTranscript($: any, home: string, sid: string, cwd: st
   let lastErr = '';
   const readOne = async (p: string): Promise<TxProbe | null> => {
     try {
+      // 先 stat 拿体积：超限时在 debug 里留痕（fs.stat 失败不影响后续 read）
+      let size = 0;
+      try {
+        const st = await $.fs.stat(p);
+        if (st && typeof st.size === 'number' && st.size > 0) size = st.size;
+      } catch { /* stat 不可用则按未知处理 */ }
       const v = await $.fs.read(p);
       const txt = typeof v === 'string' ? v : v && typeof (v as { text?: unknown }).text === 'string' ? (v as { text: string }).text : '';
       if (!txt) return null;
-      if (txt.length > MAX_INPUT_BYTES) return { err: 'transcript too big', bytes: txt.length, path: p };
-      return { used: lastInputTokens(txt), bytes: txt.length, path: p };
+      const truncated = size > MAX_INPUT_BYTES || txt.length > MAX_INPUT_BYTES;
+      // 尾部采样：只解析末尾若干行；被截断文件的首行可能是半行，丢弃不影响结论
+      const from = truncated ? Math.max(0, txt.length - TX_TAIL_CHARS) : 0;
+      const used = lastInputTokens(txt, from);
+      if (truncated && used === undefined) {
+        // 尾部没抓到（罕见：尾部全是工具调用行）→ 再放宽到整文件尾部大窗口
+        return { err: 'transcript tail has no usage', bytes: size || txt.length, path: p, truncated: true };
+      }
+      return { used, bytes: size || txt.length, path: p, truncated };
     } catch (e) { lastErr = String(e); return null; }
   };
   const slug = projectSlug(cwd);
@@ -907,7 +931,7 @@ export function register(on: On, _options?: unknown): void {
           // v0.12：宿主 binding 的 tokens 恒 0 → 从 transcript 尾部取真实 inputTokens，
           // 窗口仍用 usage().context.window（真算的）。同一次读取兼作沙箱读权限探测。
           const tp = await probeTranscript($, cfg.home, await getFullSid($), await getCwd($), cfg.projects);
-          const fsSig = JSON.stringify({ ok: !!tp.used, err: tp.err ?? null, path: tp.path ?? null, bytes: tp.bytes ?? null });
+          const fsSig = JSON.stringify({ ok: !!tp.used, err: tp.err ?? null, path: tp.path ?? null, bytes: tp.bytes ?? null, truncated: tp.truncated ?? false });
           if (fsSig !== lastFsSig) {   // 权限结论没变就不重复落盘
             lastFsSig = fsSig;
             await writeDebug($, cfg.home, await getSid8($), 'fsprobe', { source: 'transcript', ...tp });
