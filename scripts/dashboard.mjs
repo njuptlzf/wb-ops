@@ -135,7 +135,7 @@ function sessionDetail(s) {
   const capped = s.events.length >= 300 ? '（事件流封顶最近 300 次，更早的只进累计）' : '';
   return `${timelineChart(s.events)}
 <table class="mt"><tr><th>模型</th><th>次数</th><th>原文</th><th>压缩后</th><th>省</th></tr>${rows}</table>
-<div class="legend">上图按事件时刻排序${capped}；下表是该会话的模型累计（全史）。</div>`;
+<div class="legend">上图按事件时刻排序${capped}；上表是该会话的模型累计（全史）。</div>`;
 }
 
 function fmtTs(ts) {
