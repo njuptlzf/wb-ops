@@ -14,12 +14,31 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { collectRows, summarize, fmtBytes, fmtTok, statsDir } from '../lib/report-core.mjs';
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-/** 会话行 → 展示模型：主口径优先 token，老账本（无 tok 字段）回落字节。 */
-export function buildModel(rows) {
+/** 会话名解析：读宿主 workbuddy.db 的 sessions 表（id 前 8 位 ↔ stats 文件名）。
+ *  零依赖（node:sqlite，Node ≥22.5）；任何失败 → 空表，看板退化为纯 hash 展示，不报错。 */
+export function sessionNames(statsDirPath) {
+  const out = {};
+  try {
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+    const db = new DatabaseSync(resolve(statsDirPath, '..', '..', 'workbuddy.db'), { readOnly: true });
+    for (const r of db.prepare('select id, title, custom_title from sessions').all()) {
+      const sid8 = String(r.id || '').slice(0, 8);
+      const name = String(r.custom_title || r.title || '').trim();
+      if (sid8 && name) out[sid8] = name;
+    }
+    db.close();
+  } catch {}
+  return out;
+}
+
+/** 会话行 → 展示模型：主口径优先 token，老账本（无 tok 字段）回落字节。
+ *  names：sid8 → 会话名（宿主 sessions 表），缺了就纯 hash 展示。 */
+export function buildModel(rows, names = {}) {
   const agg = summarize(rows);
   const sessions = rows
     .map((r) => {
@@ -27,10 +46,12 @@ export function buildModel(rows) {
       const base = useTok ? r.tokBefore : r.before;
       const kept = useTok ? r.tokAfter : r.after;
       const saved = base - kept;
+      const sid = r.file.replace(/\.json$/, '');
       return {
         ...r,
         useTok,
-        sid: r.file.replace(/\.json$/, ''),
+        sid,
+        name: names[sid] || '',
         base, kept, saved,
         pct: base ? (saved / base) * 100 : 0,
         kinds: Object.entries(r.kinds || {}).sort((a, b) => ((b[1].tokBefore || b[1].before) - (a[1].tokBefore || a[1].before))),
@@ -64,7 +85,7 @@ function sessionCard(s, maxBase) {
     })
     .join('');
   return `<div class="card">
-  <div class="row"><b class="sid">${esc(s.sid)}</b><span class="meta">${fmtTs(s.ts)} · ${s.calls} 次压缩 · 最后 ${esc(s.tool)}</span>
+  <div class="row">${s.name ? `<b class="sname">${esc(s.name)}</b><span class="sid dim">${esc(s.sid)}</span>` : `<b class="sid">${esc(s.sid)}</b>`}<span class="meta">${fmtTs(s.ts)} · ${s.calls} 次压缩 · 最后 ${esc(s.tool)}</span>
     <span class="saved">省 <b>${fmtNum(s.saved, s.useTok)}</b> (${s.pct.toFixed(0)}%)</span></div>
   <div class="bar"><div class="seg all" style="width:${wBase.toFixed(1)}%" title="原文 ${fmtNum(s.base, s.useTok)}"><div class="seg kept" style="width:${(s.base ? (s.kept / s.base) * 100 : 0).toFixed(1)}%" title="压缩后 ${fmtNum(s.kept, s.useTok)}"></div></div></div>
   <div class="legend">原文 ${fmtNum(s.base, s.useTok)} → 压缩后 ${fmtNum(s.kept, s.useTok)}（深色=留在上下文，浅色=省掉）${s.useTok ? '' : ' · 旧账本无 tok 字段，按字节'}</div>
@@ -98,6 +119,8 @@ h1{font-size:19px;margin:0 0 2px}
 .card{background:#171d24;border:1px solid #232c36;border-radius:10px;padding:12px 16px;margin-bottom:10px}
 .row{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
 .sid{font-family:Consolas,monospace;font-size:15px}
+.sname{font-size:15px}
+.sid.dim{font-size:12px;color:#66717c;font-weight:400}
 .meta{color:#8a97a5;font-size:12px;flex:1}
 .saved{color:#6fd08c;font-size:14px}
 .saved b{font-size:16px}
@@ -126,7 +149,8 @@ ${body}
 }
 
 function page() {
-  return renderHtml(buildModel(collectRows()), { generatedAt: new Date().toLocaleString('zh-CN', { hour12: false }), dir: statsDir() });
+  const dir = statsDir();
+  return renderHtml(buildModel(collectRows(), sessionNames(dir)), { generatedAt: new Date().toLocaleString('zh-CN', { hour12: false }), dir });
 }
 
 // ---------------- CLI（被 import 时不执行） ----------------

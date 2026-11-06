@@ -2,7 +2,9 @@
 // 与 register.test.ts 分开跑：node --test test/dashboard.test.mjs
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildModel, renderHtml } from '../scripts/dashboard.mjs';
+import { mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { buildModel, renderHtml, sessionNames } from '../scripts/dashboard.mjs';
 
 const row = (o) => ({ file: 'x.json', calls: 1, before: 0, after: 0, tokBefore: 0, tokAfter: 0, tool: 'shell', ts: '2026-11-05T10:00:00.000Z', kinds: {}, ...o });
 
@@ -50,4 +52,36 @@ test('renderHtml：sid/tool/kind 全部 HTML 转义', () => {
   assert.ok(!html.includes('<script>alert(1)</script>'));
   assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
   assert.ok(!html.match(/class="sid">e<img>/));
+});
+
+test('buildModel：names 命中给会话名，未命中留空', () => {
+  const m = buildModel([row({ file: 'aa112233.json', before: 100, after: 40 }), row({ file: 'bb445566.json', before: 90, after: 30 })], { aa112233: '重新验收已定位项目' });
+  assert.equal(m.sessions.find((s) => s.sid === 'aa112233').name, '重新验收已定位项目');
+  assert.equal(m.sessions.find((s) => s.sid === 'bb445566').name, '');
+});
+
+test('renderHtml：有名卡片=名称主导+hash 弱化；无名卡片仍纯 hash；名称转义', () => {
+  const html = renderHtml(buildModel([row({ file: 'aa112233.json', before: 100, after: 40 }), row({ file: 'cc<img>.json', before: 80, after: 30 })], { aa112233: '<b>坏名称</b>', cc: '不该命中' }), {});
+  assert.match(html, /<b class="sname">&lt;b&gt;坏名称&lt;\/b&gt;<\/b><span class="sid dim">aa112233<\/span>/);
+  assert.match(html, /<b class="sid">cc&lt;img&gt;<\/b>/); // 无名字段：走 sid 分支（转义在别处钉）
+  assert.ok(!html.includes('<b class="sname">不该命中'));
+});
+
+test('sessionNames：真 sqlite 临时库解析；坏路径/缺表 → 空表不抛', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'wbops-names-'));
+  const stats = join(dir, 'wb-ops', 'stats');
+  mkdirSync(stats, { recursive: true });
+  const db = new DatabaseSync(join(dir, 'workbuddy.db'));
+  db.exec('create table sessions (id text, title text, custom_title text)');
+  db.prepare('insert into sessions values (?,?,?)').run('aa112233-0000-0000-0000-000000000000', '自动标题', null);
+  db.prepare('insert into sessions values (?,?,?)').run('bb224466-0000-0000-0000-000000000000', '自动标题', '用户改名');
+  db.prepare('insert into sessions values (?,?,?)').run('cc335577-0000-0000-0000-000000000000', null, null);
+  db.close();
+  const names = sessionNames(stats);
+  assert.deepEqual(names, { aa112233: '自动标题', bb224466: '用户改名' }); // custom_title 优先；空名丢弃
+  assert.deepEqual(sessionNames(join(dir, 'nope', 'wb-ops', 'stats')), {}); // db 不存在 → 空表（../.. 必须落到没有 workbuddy.db 的目录）
+  rmSync(dir, { recursive: true, force: true });
 });
