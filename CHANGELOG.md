@@ -4,6 +4,11 @@
 
 > 真机验证证据与复现命令见 [docs/VERIFICATION.md](docs/VERIFICATION.md)；设计取舍见 [docs/DESIGN.md](docs/DESIGN.md)。
 
+## [未发布]
+
+- **算法文档**：`docs/ALGORITHMS.md`——各出口的省量算法、阈值与 token 估算口径首次成文
+- **保真度 benchmark**：`test/benchmark.mjs`（`node test/benchmark.mjs`）——9 个预埋锚点夹具实测压缩后上下文失真度：零捏造、critical 锚点 100%、对比朴素截断基线；兼作回归门禁（退出码门槛）。方法论与结果解读见 `docs/BENCHMARK.md`
+
 ## [0.16.0] · 2026-11-06 —— 模型维度 + 逐压缩事件流
 
 **一句话**：回答两个真实问题——「每个会话每次压缩省了多少（时间轴）」「每个模型总共省了多少」。答案是数据此前根本没记：老账本只有会话级累计值。v0.16 把这两样补进记账，看板随之可视化；**旧账本无法回填**，看板对缺失数据如实显示空态。

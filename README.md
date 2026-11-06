@@ -84,7 +84,7 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" pl
 | WebFetch / WebSearch | 标题/链接/加粗行当骨架捞回，正文省略 |
 | 其余工具（含 MCP） | 通配兜底通用压缩，失败同样完整透传，可单独关闭 |
 
-所有档位共用：预算按 UTF-8 字节计、原文 >8MB 透传、fail-open。完整策略与设计原理见 [docs/DESIGN.md](docs/DESIGN.md)。
+所有档位共用：预算按 UTF-8 字节计、原文 >8MB 透传、fail-open。完整算法见 [docs/ALGORITHMS.md](docs/ALGORITHMS.md)；压缩后是否失真见 [docs/BENCHMARK.md](docs/BENCHMARK.md)。
 
 ## ⚙️ 配置
 
@@ -124,6 +124,8 @@ bash test/run-acceptance.sh <合法UUID> "验收" WB_OPS_GUARD_PCT=10   # 真机
 
 | 文档 | 内容 |
 |---|---|
+| [docs/ALGORITHMS.md](docs/ALGORITHMS.md) | 算法说明：各出口的省量算法、阈值与 token 估算口径 |
+| [docs/BENCHMARK.md](docs/BENCHMARK.md) | 保真度 benchmark：压缩后上下文是否失真？方法论与结果（`node test/benchmark.mjs` 可复跑，兼作回归门禁） |
 | [docs/DESIGN.md](docs/DESIGN.md) | 设计文档：为什么是 Mod、热路径性能纪律、记账三元组、诊断通道、宿主形状实测 |
 | [docs/VERIFICATION.md](docs/VERIFICATION.md) | 验证报告：真机验收流程、原始数据、复现命令、已验证/未验证清单 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录 |
