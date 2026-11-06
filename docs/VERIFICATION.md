@@ -345,7 +345,7 @@ fs.writeFileSync(p, fs.readFileSync(p+'.wbops-bak')); fs.unlinkSync(p+'.wbops-ba
 # 4. 核对：plugin list → enabled；settings.json 顶层键与原始一致
 ```
 
-全部历史验收过程与结论同时记录于 `.workbuddy/memory/2026-11-05.md`（仓库内）。
+全部历史验收过程与结论由本地工作日志留存（不入库）。
 
 ---
 
