@@ -185,7 +185,7 @@ function sessionCard(s, maxBase) {
   <div class="bar"><div class="seg all" style="width:${wBase.toFixed(1)}%" title="原文 ${fmtNum(s.base, s.useTok)}"><div class="seg kept" style="width:${(s.base ? (s.kept / s.base) * 100 : 0).toFixed(1)}%" title="压缩后 ${fmtNum(s.kept, s.useTok)}"></div></div></div>
   <div class="legend">原文 ${fmtNum(s.base, s.useTok)} → 压缩后 ${fmtNum(s.kept, s.useTok)}（深色=留在上下文，浅色=省掉）${s.useTok ? '' : ' · 旧账本无 tok 字段，按字节'}</div>
   <div class="chips">${chips}</div>
-  <details class="dt"><summary>时间轴详情（v0.16）</summary>${sessionDetail(s)}</details>
+  <details class="dt"><summary>时间轴详情</summary>${sessionDetail(s)}</details>
 </details>`;
   }
   return `<div class="card">
@@ -193,7 +193,7 @@ function sessionCard(s, maxBase) {
   <div class="bar"><div class="seg all" style="width:${wBase.toFixed(1)}%" title="原文 ${fmtNum(s.base, s.useTok)}"><div class="seg kept" style="width:${(s.base ? (s.kept / s.base) * 100 : 0).toFixed(1)}%" title="压缩后 ${fmtNum(s.kept, s.useTok)}"></div></div></div>
   <div class="legend">原文 ${fmtNum(s.base, s.useTok)} → 压缩后 ${fmtNum(s.kept, s.useTok)}（深色=留在上下文，浅色=省掉）${s.useTok ? '' : ' · 旧账本无 tok 字段，按字节'}</div>
   <div class="chips">${chips}</div>
-  <details class="dt"><summary>时间轴详情（v0.16）</summary>${sessionDetail(s)}</details>
+  <details class="dt"><summary>时间轴详情</summary>${sessionDetail(s)}</details>
 </div>`;
 }
 
