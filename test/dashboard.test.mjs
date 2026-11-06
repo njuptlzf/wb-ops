@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { buildModel, renderHtml, sessionNames, timelineChart } from '../scripts/dashboard.mjs';
+import { buildModel, renderHtml, sessionNames, timelineChart, eventStrip } from '../scripts/dashboard.mjs';
 
 const row = (o) => ({ file: 'x.json', calls: 1, before: 0, after: 0, tokBefore: 0, tokAfter: 0, tool: 'shell', ts: '2026-11-05T10:00:00.000Z', kinds: {}, ...o });
 
@@ -139,6 +139,42 @@ test('timelineChart：事件多时加宽 SVG 并套横向滚动容器；事件�
   const cap = Array.from({ length: 300 }, (_, i) => ({ t: 1730000000000 + i * 1000, k: 'shell', m: 'glm', tb: 100, ta: 50 }));
   const wc = Number(timelineChart(cap).match(/viewBox="0 0 (\d+)/)[1]);
   assert.ok(wc < 5600, `300 事件宽度应 <5600px，实得 ${wc}`);
+});
+
+// ---------------- v0.18.3：逐次压缩明细条 ----------------
+
+test('eventStrip：每次压缩一条，按时间正序，含序号/时刻/工具/前后 tok/省比', () => {
+  assert.equal(eventStrip([]), '');
+  const out = eventStrip([
+    { t: new Date(2026, 10, 6, 17, 30, 5).getTime(), k: 'shell', m: 'glm', tb: 2000, ta: 500 },
+    { t: new Date(2026, 10, 6, 17, 31, 9).getTime(), k: 'read', m: 'glm', tb: 1000, ta: 800 },
+  ]);
+  assert.match(out, /逐次压缩明细（共 2 次/);
+  assert.match(out, /class="events"/);
+  assert.equal((out.match(/class="ec"/g) || []).length, 2, '每次压缩一张卡');
+  assert.match(out, /#1[\s\S]*17:30:05[\s\S]*shell[\s\S]*≈2\.0k[\s\S]*→≈500[\s\S]*省 75%/);
+  assert.match(out, /#2[\s\S]*17:31:09[\s\S]*read[\s\S]*省 20%/);
+  // 倒序输入 → 输出仍按时间正序（序号 #1 是最早那次）
+  const rev = eventStrip([{ t: 2000, k: 'a', tb: 100, ta: 50 }, { t: 1000, k: 'b', tb: 100, ta: 50 }]);
+  assert.match(rev, /#1[\s\S]*class="ec-k">b</, '最早的事件是 #1');
+});
+
+test('eventStrip：54 次压缩全部铺出（不截断），单行横向滚动', () => {
+  const many = Array.from({ length: 54 }, (_, i) => ({ t: 1793951000000 + i * 60000, k: 'shell', m: 'glm', tb: 1000 + i, ta: 500 }));
+  const out = eventStrip(many);
+  assert.equal((out.match(/class="ec"/g) || []).length, 54, '54 次一次不少');
+  assert.match(out, /共 54 次/);
+  assert.match(out, /#54/, '序号到 #54');
+});
+
+test('renderHtml：详情里明细条在时间轴图之前，两者共存', () => {
+  const html = renderHtml(buildModel([row({ file: 'a.json', tokBefore: 600, tokAfter: 150,
+    models: { 'glm-4.6': { calls: 2, tokBefore: 500, tokAfter: 120 } },
+    events: [{ t: 1, k: 'shell', m: 'glm-4.6', tb: 400, ta: 90 }, { t: 2, k: 'read', m: 'glm-4.6', tb: 100, ta: 30 }] })]));
+  const iStrip = html.indexOf('逐次压缩明细');
+  const iChart = html.indexOf('<svg ');
+  assert.ok(iStrip >= 0 && iChart >= 0, '两者都渲染');
+  assert.ok(iStrip < iChart, '明细条在图之前（先看逐条，再看趋势）');
 });
 
 test('buildModel：archived 沉底（同省量下归档排后），标记来自 names', () => {

@@ -141,6 +141,36 @@ function colorFor(sorted, e) {
   return modelColor(models.indexOf(e.m || 'unknown'));
 }
 
+/** 逐次压缩明细：每次压缩一张小卡，横向并排 + 横向滚动。
+ *  这是「54 次每次干了什么」的正面回答——折线图看趋势，这里看逐条记录。
+ *  纵向只占一行高度，卡片再多也不拉长页面。 */
+export function eventStrip(events) {
+  if (!Array.isArray(events) || !events.length) return '';
+  const sorted = events.slice().sort((a, b) => (a.t || 0) - (b.t || 0));
+  const items = sorted.map((e, i) => {
+    const saved = e.tb ? Math.round(((e.tb - e.ta) / e.tb) * 100) : 0;
+    return `<div class="ec" title="${esc(fmtTs(e.t ? new Date(e.t).toISOString() : ''))} · ${esc(e.k || '?')} · ${esc(e.m || 'unknown')} · ≈${fmtTok(e.tb)}→≈${fmtTok(e.ta)} tok">
+  <div class="ec-n">#${i + 1}</div>
+  <div class="ec-t">${esc(fmtClock(e.t))}</div>
+  <div class="ec-k">${esc(e.k || '?')}</div>
+  <div class="ec-v">≈${fmtTok(e.tb)}</div>
+  <div class="ec-v dim">→≈${fmtTok(e.ta)}</div>
+  <div class="ec-s">省 ${saved}%</div>
+</div>`;
+  }).join('');
+  return `<div class="legend">逐次压缩明细（共 ${sorted.length} 次，按时间正序；横向滚动查看全部）</div>
+<div class="events">${items}</div>`;
+}
+
+/** 时刻 HH:MM:SS（明细条空间小，只给时秒）。 */
+function fmtClock(t) {
+  if (!t) return '';
+  const d = new Date(t);
+  if (Number.isNaN(d.getTime())) return '';
+  const p = (x) => String(x).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 /** 会话详情（卡片内 <details> 展开）：时间轴图 + 按模型小表 + 封顶说明。 */
 function sessionDetail(s) {
   if (!s.events.length) {
@@ -154,7 +184,8 @@ function sessionDetail(s) {
     })
     .join('');
   const capped = s.events.length >= 300 ? '（事件流封顶最近 300 次，更早的只进累计）' : '';
-  return `${timelineChart(s.events)}
+  return `${eventStrip(s.events)}
+${timelineChart(s.events)}
 <table class="mt"><tr><th>模型</th><th>次数</th><th>原文</th><th>压缩后</th><th>省</th></tr>${rows}</table>
 <div class="legend">上图按事件时刻排序${capped}；上表是该会话的模型累计（全史）。</div>`;
 }
@@ -260,6 +291,16 @@ details.dt[open] summary{margin-bottom:8px}
 .tlscroll{overflow-x:auto;overflow-y:hidden;margin:8px 0;border:1px solid #232c36;border-radius:6px}
 .tlscroll::-webkit-scrollbar{height:8px}
 .tlscroll::-webkit-scrollbar-thumb{background:#2c3742;border-radius:4px}
+.events{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden;padding:6px 0 10px;margin:4px 0}
+.events::-webkit-scrollbar{height:8px}
+.events::-webkit-scrollbar-thumb{background:#2c3742;border-radius:4px}
+.ec{flex:0 0 auto;min-width:86px;background:#20282f;border:1px solid #2c3742;border-radius:6px;padding:6px 8px;font-size:11px;line-height:1.45}
+.ec-n{color:#66717c;font-size:10px}
+.ec-t{color:#b7c2cd;font-family:Consolas,monospace;font-size:11px}
+.ec-k{color:#61afef;font-size:11px;margin:1px 0}
+.ec-v{color:#dfe6ee;font-family:Consolas,monospace;font-size:11px}
+.ec-v.dim{color:#8a97a5}
+.ec-s{color:#6fd08c;font-size:10px;margin-top:2px}
 .tag{background:#20282f;border:1px solid #2c3742;border-radius:4px;padding:1px 8px;font-size:11px;color:#8a97a5;white-space:nowrap}
 details.card.arch{padding:0}
 details.card.arch>summary{padding:12px 16px;cursor:pointer;list-style:none}
