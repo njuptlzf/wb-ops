@@ -55,13 +55,13 @@ test('renderHtml：sid/tool/kind 全部 HTML 转义', () => {
 });
 
 test('buildModel：names 命中给会话名，未命中留空', () => {
-  const m = buildModel([row({ file: 'aa112233.json', before: 100, after: 40 }), row({ file: 'bb445566.json', before: 90, after: 30 })], { aa112233: '重新验收已定位项目' });
+  const m = buildModel([row({ file: 'aa112233.json', before: 100, after: 40 }), row({ file: 'bb445566.json', before: 90, after: 30 })], { aa112233: { name: '重新验收已定位项目' } });
   assert.equal(m.sessions.find((s) => s.sid === 'aa112233').name, '重新验收已定位项目');
   assert.equal(m.sessions.find((s) => s.sid === 'bb445566').name, '');
 });
 
 test('renderHtml：有名卡片=名称主导+hash 弱化；无名卡片仍纯 hash；名称转义', () => {
-  const html = renderHtml(buildModel([row({ file: 'aa112233.json', before: 100, after: 40 }), row({ file: 'cc<img>.json', before: 80, after: 30 })], { aa112233: '<b>坏名称</b>', cc: '不该命中' }), {});
+  const html = renderHtml(buildModel([row({ file: 'aa112233.json', before: 100, after: 40 }), row({ file: 'cc<img>.json', before: 80, after: 30 })], { aa112233: { name: '<b>坏名称</b>' }, cc: { name: '不该命中' } }), {});
   assert.match(html, /<b class="sname">&lt;b&gt;坏名称&lt;\/b&gt;<\/b><span class="sid dim">aa112233<\/span>/);
   assert.match(html, /<b class="sid">cc&lt;img&gt;<\/b>/); // 无名字段：走 sid 分支（转义在别处钉）
   assert.ok(!html.includes('<b class="sname">不该命中'));
@@ -75,13 +75,17 @@ test('sessionNames：真 sqlite 临时库解析；坏路径/缺表 → 空表不
   const stats = join(dir, 'wb-ops', 'stats');
   mkdirSync(stats, { recursive: true });
   const db = new DatabaseSync(join(dir, 'workbuddy.db'));
-  db.exec('create table sessions (id text, title text, custom_title text)');
-  db.prepare('insert into sessions values (?,?,?)').run('aa112233-0000-0000-0000-000000000000', '自动标题', null);
-  db.prepare('insert into sessions values (?,?,?)').run('bb224466-0000-0000-0000-000000000000', '自动标题', '用户改名');
-  db.prepare('insert into sessions values (?,?,?)').run('cc335577-0000-0000-0000-000000000000', null, null);
+  db.exec('create table sessions (id text, title text, custom_title text, status text, deleted_at text)');
+  db.prepare('insert into sessions values (?,?,?,?,?)').run('aa112233-0000-0000-0000-000000000000', '自动标题', null, 'working', null);
+  db.prepare('insert into sessions values (?,?,?,?,?)').run('bb224466-0000-0000-0000-000000000000', '自动标题', '用户改名', 'archived', null);
+  db.prepare('insert into sessions values (?,?,?,?,?)').run('cc335577-0000-0000-0000-000000000000', null, null, 'completed', '2026-11-01T00:00:00Z');
   db.close();
   const names = sessionNames(stats);
-  assert.deepEqual(names, { aa112233: '自动标题', bb224466: '用户改名' }); // custom_title 优先；空名丢弃
+  assert.equal(names.aa112233.name, '自动标题');
+  assert.equal(names.aa112233.archived, false);
+  assert.equal(names.bb224466.name, '用户改名'); // custom_title 优先
+  assert.equal(names.bb224466.archived, true); // status='archived'
+  assert.equal(names.cc335577.archived, true, 'deleted_at 非空也算归档（不展示死会话）');
   assert.deepEqual(sessionNames(join(dir, 'nope', 'wb-ops', 'stats')), {}); // db 不存在 → 空表（../.. 必须落到没有 workbuddy.db 的目录）
   rmSync(dir, { recursive: true, force: true });
 });
@@ -117,6 +121,47 @@ test('timelineChart：<2 事件返回空串；SVG 折线 + 悬停 tooltip + 模�
   assert.match(svg, /polyline/g);
   assert.match(svg, /a&lt;b&gt;/, 'tooltip 里模型名转义');
   assert.match(svg, /<title>/);
+});
+
+// ---------------- v0.18.2：横向滚动时间轴 + 归档折叠 ----------------
+
+test('timelineChart：事件多时加宽 SVG 并套横向滚动容器；事件少时铺满窗口不滚动', () => {
+  const few = Array.from({ length: 10 }, (_, i) => ({ t: 1730000000000 + i * 60000, k: 'shell', m: 'glm', tb: 100 + i, ta: 50 }));
+  const outFew = timelineChart(few);
+  assert.ok(!outFew.includes('tlscroll'), '10 个事件不该出滚动条');
+  const many = Array.from({ length: 54 }, (_, i) => ({ t: 1730000000000 + i * 60000, k: 'shell', m: 'glm', tb: 100 + i, ta: 50 }));
+  const outMany = timelineChart(many);
+  assert.match(outMany, /class="tlscroll"/, '54 个事件必须横向滚动');
+  assert.match(outMany, /横向滚动查看全部 54 次压缩/);
+  const w = Number(outMany.match(/viewBox="0 0 (\d+)/)[1]);
+  assert.ok(w > 760 && w < 1200, `宽度应约为 46+14+18×53≈1002，实得 ${w}`);
+  // 封顶 300 事件的最坏情况：宽度线性可控（≈5.4k px），不会炸页面
+  const cap = Array.from({ length: 300 }, (_, i) => ({ t: 1730000000000 + i * 1000, k: 'shell', m: 'glm', tb: 100, ta: 50 }));
+  const wc = Number(timelineChart(cap).match(/viewBox="0 0 (\d+)/)[1]);
+  assert.ok(wc < 5600, `300 事件宽度应 <5600px，实得 ${wc}`);
+});
+
+test('buildModel：archived 沉底（同省量下归档排后），标记来自 names', () => {
+  const m = buildModel(
+    [row({ file: 'act11111.json', before: 100, after: 40 }), row({ file: 'arc22222.json', before: 100, after: 40 })],
+    { arc22222: { name: '旧会话', archived: true } },
+  );
+  assert.deepEqual(m.sessions.map((s) => s.sid), ['act11111', 'arc22222'], '省量相同：未归档在前');
+  assert.equal(m.sessions[1].archived, true);
+  assert.equal(m.sessions[0].archived, false);
+});
+
+test('renderHtml：归档会话默认折叠 + 分区标题 + 已归档标记；无归档时不出分区', () => {
+  const html = renderHtml(buildModel(
+    [row({ file: 'act11111.json', before: 100, after: 40 }), row({ file: 'arc22222.json', before: 90, after: 30 })],
+    { arc22222: { name: '旧会话', archived: true } },
+  ));
+  assert.match(html, /class="archhead">已归档会话（1 个，默认折叠）/);
+  assert.match(html, /<details class="card arch"><summary>/, '归档卡片=折叠 details，无 open 属性');
+  assert.match(html, /<span class="tag">已归档<\/span>/);
+  assert.ok(!/<div class="card">\s*<div class="row"><b class="sname">旧会话/.test(html), '归档会话不得出现在展开卡片里');
+  const plain = renderHtml(buildModel([row({ file: 'act11111.json', before: 100, after: 40 })]));
+  assert.ok(!plain.includes('<div class="archhead">'), '无归档会话 → 无分区标题（CSS 规则本身恒在，断言 div）');
 });
 
 test('renderHtml v0.16：首页按模型累计块；旧账本 → 空态提示不报错', () => {
