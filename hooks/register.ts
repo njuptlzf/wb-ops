@@ -3,19 +3,19 @@
  * v0.3 覆盖面：Bash / PowerShell / TaskOutput / Grep / Glob / Read / WebFetch / WebSearch。
  * 后续按事件逐个拓展（所有烧 token 的出口）。
  *
- * 设计规则（源自 sana35421/wb-ops 的 UserPromptSubmit 5s 超时事故分析，见 README）：
+ * 设计规则（吸取同类 shell-hook 输出治理工具"同步子进程+全量扫描击穿宿主超时预算"的事故教训，见 docs/DESIGN.md）：
  *  1. 零子进程：只做 Mods 的 tool.call 中间件，不注册任何 shell hook。
  *  2. fail-open：未知形状、任何异常、超预算(时间/体积) —— 一律原样返回工具结果。
  *  3. 错误透传：isError 或 Exit Code 非零的输出不压缩（保完整现场）；shell 失败现场另附一行
  *     nextAction 提示（HINTS 表），对应 dsh-ops「报错重试循环」遏制原则——提示不是压缩，不加预算负担。
  *  4. 确定性策略：head/tail + 关键行 + 原文落盘（spill）带回查路径，热路径无 LLM。
  *  5. 并发安全：无共享可变状态文件；spill 文件名含 session/callId/序号，互不覆盖。
- *  6. 双压缩防护：已带本插件或 sana 版标记的文本不再处理。
+ *  6. 双压缩防护：已带本插件或同类工具标记的文本不再处理。
  *  7. 宿主已兜底的不碰：Read 的 <persisted-output>（宿主自己落盘并给预览）直接透传。
  *
- * 数值来源：sana35421/wb-ops trim.py v1.3.3 实测校准过的阈值（字节预算、头尾占比 30/22、
- * FILL_TARGET 85%、KEY 行 40 条均匀抽样、空洞指路 ≥20 行等）——那是 544 测试 + 真实
- * 使用磨出来的数字，重调一遍纯烧 token。
+ * 数值来源：经同类工具长期真实使用校准过的阈值（字节预算、头尾占比 30/22、
+ * FILL_TARGET 85%、KEY 行 40 条均匀抽样、空洞指路 ≥20 行等）——已被大量测试与
+ * 真实使用磨出来的数字，重调一遍纯烧 token。
  *
  * 沙箱约束：mods 内禁止 node:require/process/global —— 本文件零运行时 import、不碰 global；
  * 文件系统走 $.fs，环境变量走 $.env，会话走 $.session。
@@ -24,7 +24,7 @@
 import type { On } from 'codebuddy-code';
 
 const MARKER = '[wb-ops]';                   // 本 Mod 的标记
-// sana35421/wb-ops（shell-hook 版）的真实标记前缀（trim.py L61-62），共存防双压。
+// 同类 shell-hook 输出治理工具的真实标记前缀，共存防双压。
 const FOREIGN_MARKERS = ['[wb-ops 省略', '[wb-ops 以下为原文末尾'];
 
 const DEFAULT_BUDGET = 4500;                 // 预算按 UTF-8 字节计（中文 3 字节≈1 token，按字符会漏）。
@@ -36,29 +36,29 @@ const DEFAULT_GUARD_PCT = 85;                // 水位守卫阈值（%. usage �
 const MAX_SPILL_CHARS = 4_000_000;           // 落盘写入门槛：超过不写（唯一的同步 IO 必须封顶）
 const MAX_INPUT_BYTES = 8_000_000;           // 超大输入一律透传（split 本身都不做）
 const TX_TAIL_CHARS = 4_000_000;             // transcript 超大时只解析尾部这么多字符（≈尾部 40 行富余）
-const LINE_MAX_BYTES = 1000;                 // 单行展示上限（防 minified 巨行吃满预算；sana MAX_LINE_BYTES）
-const KEY_MAX_LINES = 40;                    // 中段捞回上限，超出均匀抽样（sana MAX_KEY_LINES）
+const LINE_MAX_BYTES = 1000;                 // 单行展示上限（防 minified 巨行吃满预算）
+const KEY_MAX_LINES = 40;                    // 中段捞回上限，超出均匀抽样
 const KEY_POOL_MAX = 4000;                   // 命中爆炸护栏：池满即用已有部分
-const GAP_HINT_MIN_LINES = 20;               // 空洞指路门槛（sana v1.3.0）
+const GAP_HINT_MIN_LINES = 20;               // 空洞指路门槛
 const GAP_HINT_MAX_LIMIT = 180;              // 指路 limit 上限：太大又会被同一道门槛裁一次
 const READ_HEAD_MIN = 20, READ_HEAD_MAX = 400, READ_TAIL_MIN = 10, READ_TAIL_MAX = 300;
 const HEAD_MIN = 8, HEAD_MAX = 400, TAIL_MIN = 5, TAIL_MAX = 300;
-const FILL_TARGET = 0.85;                    // 预算利用率目标（sana：打满会塞进低价值行，不追求）
+const FILL_TARGET = 0.85;                    // 预算利用率目标（打满会塞进低价值行，不追求）
 const GROW_ROUNDS = 5;                       // 头尾扩张轮数上限（每轮 ×1.25）
 const MARKER_RESERVE = 1200;                 // 硬截余量（标记行本身要放得下）
 // ponytail: 上限=4MB 以上的原文不落盘（仍压缩，标记如实说明「过大」）；升级路径=分块异步写或
 // 只存最长空洞段。100MB split 约 0.5–1s，线性且有引擎 10s 兜底。
 
-// 关键行（英文+中文+warn 档；sana KEY_PATTERN v1.3.3 并集）
+// 关键行（英文+中文+warn 档并集）
 const KEY = /(error|fatal|exception|traceback|panic|fail|failure|warn|cannot|denied|refused|not found|no such file|undefined reference|segmentation|core dumped|abort|assert|timeout|timed out|\bexited with code\b|错误|失败|警告|异常|未能|无法|超时|拒绝)/i;
-// 源码骨架行（sana SYMBOLS，子串匹配）
+// 源码骨架行（子串匹配）
 const SYMBOLS = ['#include', 'function ', 'def ', 'class ', 'struct ', 'namespace ', 'impl ', 'interface ', 'pub fn', 'export ', 'typedef ', 'import '];
 // 文档骨架：md 标题 / 加粗标题 / 链接行（WebFetch/WebSearch 输出的天然目录）
 const DOC_HEAD = /^#{1,6}\s|^\*\*|^https?:\/\/|^\s*[-*]\s\[|^\[[^\]]+\]\(/;
 // Read 行号前缀：`  43→content`（实测 WorkBuddy Read 输出格式）
 const READ_LINE_NO = /^\s*(\d+)\u2192/;
 
-/** Read 分档（sana v1.2.2/v1.3.0：读完多半要接着改的，门槛高，中段不能随便丢） */
+/** Read 分档（读完多半要接着改的，门槛高，中段不能随便丢） */
 const DATA_EXTS = ['.log', '.jsonl', '.ndjson', '.csv', '.tsv', '.out', '.err', '.txt'];
 
 interface ReadGate { minLines: number; hardBytes: number; skeleton: 'keyword' | 'symbol' | 'heading'; }
@@ -340,7 +340,7 @@ export function compress(
   const lines = raw.split('\n');
   const total = lines.length;
 
-  // Read 分档行数门。硬阀例外只给「行数少体量巨大的 dump」（sana READ_STRUCT_HARD_BYTES）；
+  // Read 分档行数门。硬阀例外只给「行数少体量巨大的 dump」；
   // 几百行的整篇文档不算 dump——误伤整篇文档比漏压贵。
   if (opts?.minLines && total < opts.minLines && !(opts.hardBytes && bytes >= opts.hardBytes && total <= 60)) return null;
 
@@ -358,7 +358,7 @@ export function compress(
     return { text: byteLen(text) > budget + MARKER_RESERVE ? u8Prefix(text, budget + MARKER_RESERVE) + `\n${MARKER} …截断` : text, dropped: bytes };
   }
 
-  // ---- 自适应头尾：按平均行长估行数（sana v1.1：固定行数对短行/长行两头都亏）----
+  // ---- 自适应头尾：按平均行长估行数（固定行数对短行/长行两头都亏）----
   const avg = Math.max(8, bytes / total);
   const headMin = mode === 'read' ? READ_HEAD_MIN : HEAD_MIN;
   const headMax = mode === 'read' ? READ_HEAD_MAX : HEAD_MAX;
@@ -398,7 +398,7 @@ export function compress(
     for (const i of pool) if (i >= headKeep && i < total - tailKeep) mid.push(i);
     if (mid.length > KEY_MAX_LINES) {
       const step = Math.ceil(mid.length / KEY_MAX_LINES);
-      keyIdx = mid.filter((_, j) => j % step === 0); // 均匀撒点（sana：连续段等于没省）
+      keyIdx = mid.filter((_, j) => j % step === 0); // 均匀撒点（连续段等于没省）
     } else keyIdx = mid;
     if (mode === 'shell') {
       // Exit Code 行保底：命令失败现场已透传，能走到这说明它是 0——但这行必须可见，
@@ -417,7 +417,7 @@ export function compress(
     tailN = Math.min(Math.floor(tailN * 1.25) + 1, tailMax, sideMax);
   }
 
-  // 空洞指路（sana v1.3.0）：只认最长连续段，≥20 行才指；仅 Read（有行号可指）
+  // 空洞指路：只认最长连续段，≥20 行才指；仅 Read（有行号可指）
   let hint = '';
   if (mode === 'read') {
     const keep = new Set<number>(keyIdx);
@@ -576,7 +576,7 @@ async function recordStats($: any, home: string, sid: string, tool: string, befo
     cur.after = (cur.after || 0) + after;
     cur.tokBefore = (cur.tokBefore || 0) + beforeTok;
     cur.tokAfter = (cur.tokAfter || 0) + afterTok;
-    cur.kinds = cur.kinds || {}; // ① 按类细分（对齐 sana 明细账本的口径维度；老文件无此字段自动补上）
+    cur.kinds = cur.kinds || {}; // ① 按类细分（老文件无此字段自动补上）
     const kk = cur.kinds[tool] = cur.kinds[tool] || { calls: 0, before: 0, after: 0, tokBefore: 0, tokAfter: 0 };
     kk.calls++; kk.before += before; kk.after += after;
     kk.tokBefore = (kk.tokBefore || 0) + beforeTok; kk.tokAfter = (kk.tokAfter || 0) + afterTok;
@@ -628,7 +628,7 @@ export async function probeUsage($: any): Promise<{ value?: unknown; shape?: Rec
 // $.session.usage() 的宿主形状未文档化：bundle 里同时存在 {used,size}、{inputTokens,contextWindow}
 // 与 v0.12 实测的嵌套 {context:{tokens,window,percent}} 三套构造 → 多字段候选。
 // tokens===0 视为「无数据」（真实会话上下文不可能为 0；宿主当前正卡在这个缺口上），
-// 判不出即返回 null，守卫静默（对齐 sana 事故的根治：无阻塞、无扫描、可整体关闭）。
+// 判不出即返回 null，守卫静默（无阻塞、无扫描、可整体关闭）。
 export function pickWatermark(u: unknown): { used: number; size: number } | null {
   if (!u || typeof u !== 'object') return null;
   const o = u as Record<string, unknown>;
@@ -753,7 +753,7 @@ export async function probeTranscript($: any, home: string, sid: string, cwd: st
   return { err: lastErr || 'transcript not found' };
 }
 
-/** ② 水位数值行：sana ctx-guard 的 budget/<sid8>.num 等价物——模型可 Read 的纯文本余量。 */
+/** ② 水位数值行：模型可 Read 的纯文本余量。 */
 export function watermarkLine(w: { used: number; size: number }, source = 'usage'): string {
   const pct = ((w.used / w.size) * 100).toFixed(1);
   return `${w.size - w.used}\n已用 ${w.used}/${w.size} tok（${pct}%）· ${new Date().toISOString()}${source !== 'usage' ? ' · 来源 ' + source : ''}`;
@@ -820,7 +820,7 @@ function makeHandler(kind: string) {
       if (len * 3 < cfg.budget) return r;         // 每字符顶格 3 字节也进不了预算：免测
       const bytes = byteLen(t.raw);               // 预算是字节语义；字符数会放过「字符≤预算<字节」的中文串
       if (bytes <= cfg.budget || bytes > MAX_INPUT_BYTES) return r;
-      if (alreadyMarked(t.raw)) return r;         // 双压缩防护（含 sana 标记）
+      if (alreadyMarked(t.raw)) return r;         // 双压缩防护（含同类工具标记）
 
       let gate: ReadGate | null = null;
       if (kind === 'read') {
@@ -894,7 +894,7 @@ export function register(on: On, _options?: unknown): void {
   // 预算内的输出本来就原样透传——兜底只碰真正超线的，Edit/Write 这类小结果零影响。
   on('tool.call', { tool: (v: unknown) => typeof v === 'string' && !KNOWN_TOOLS.has(v) }, makeHandler('other'));
 
-  // #4 水位守卫：每轮用户提交查一次 $.session.usage()（进程内 O(1)，非 sana 那种 16MB transcript 尾扫）
+  // #4 水位守卫：每轮用户提交查一次 $.session.usage()（进程内 O(1)，非每回合同步扫大文件的路线）
   // 越线才改写：契约 {text, context:string[]}，context 数组随 prompt 进模型（bundle @2099903 合并逻辑）
   on('prompt.submit', async ($: any, e: any, next: any) => {
     try {

@@ -346,3 +346,46 @@ fs.writeFileSync(p, fs.readFileSync(p+'.wbops-bak')); fs.unlinkSync(p+'.wbops-ba
 ```
 
 全部历史验收过程与结论同时记录于 `.workbuddy/memory/2026-11-05.md`（仓库内）。
+
+---
+
+## 6. 真机安装闭环（官方《插件市场》文档校对，2026-11-05）
+
+宿主加载一个 mod 需要三处同时成立（`enabledPlugins` + `installed_plugins.json` + `cache` 快照），**只登记 installed 条目是不够的**——`getInstalledPluginsForWorkspaceState` 的候选集直接来自 `enabledPlugins` 映射，缺它则 `status=disabled`，插件连「已安装」列表都进不去，mod 永不加载。这条是原 `install-gui.mjs` 的漏项，已补：
+
+| 落点 | 状态 |
+|---|---|
+| `marketplaces/wb-ops-local/.codebuddy-plugin/marketplace.json` | ✅ 已补（官方要求：市场根目录必须有） |
+| `installed_plugins.json` → `wb-ops@wb-ops-local` | ✅ 原有 |
+| `settings.json` → `enabledPlugins["wb-ops@wb-ops-local"]=true` | ✅ 已补（原漏项） |
+
+本机真机验证（`CODEBUDDY_CONFIG_DIR` 指到 `~/.workbuddy`）：
+
+- `plugin validate` 对插件清单与市场清单**双双 ✔ Validation passed**；
+- `plugin list` → `wb-ops@wb-ops-local / user / Status: enabled`；
+- 宿主打印 `mods: loaded mod "wb-ops" from .codebuddy-plugin (tier user, hooks: …)`——**走市场安装路径加载**（不带 `--plugin-dir`）；
+- 会话日志 `~/.workbuddy/logs/<date>/<cwd>__<sid>.log` 里可见该行：mod 在**新起的运行时**（新 pid）里生效，老运行时（启用前启动的）不加载 → 启用后要**新开对话**才生效，`/reload-plugins` 不重新引导 mod（`bootstrapFunctionHookMods` 只在启动时调用且被记忆化）。
+
+---
+
+## 7. 已验证 / 未验证清单（截至 v0.16）
+
+### ✅ 已验证
+
+- **通配兜底的谓词 matcher（真机闭环）**：`domain_search` 输出 52.1KB → 兜底压缩生效（头部 + 命中关键行 + 尾部，`[+NNNNB]` 单行截断正常）。函数谓词每次事件重评、路由真实生效。
+- **mods 加载**（CLI 启动日志 `hooks: tool.call prompt.submit session.compact` 三通道全注册）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示、水位守卫与压缩保留指示、通配兜底、分类账本、水位数值文件、GUI 安装助手、形状诊断通道、水位数据源、token 口径、报表 MCP、Web 看板、看板会话名、模型维度与事件流——离线 mock API 单测 **109 项全绿**（`node --test test/register.test.ts test/dashboard.test.mjs`）
+- **Grep/Glob 输出形状**：从 86 条真实 transcript 确认 = JSON 字符串数组；真机再测发现宿主原生形态是 `content: string[]`（不是 JSON 文本）→ 已适配（单测钉死：裁条目+单行说明、保持数组形态、预算内零影响、混合类型仍 fail-open）
+- **真机压缩闭环（GUI 会话）**：Bash 13.2KB / PowerShell 14.9KB / TaskOutput 30.4KB / Read .log 24.5KB（含 `回看: Read offset=34 limit=180` 空洞指路）/ MCP 兜底 52.1KB / 错误现场 Exit Code 2 完整透传 + `[wb-ops 提示]` 一行 / 预算内零影响 / Read .ts 682 行原样不裁——5 次 spill 落盘 135KB
+- **报表工具（v0.14 根治）**：`mcp__wb_ops__report` 由插件清单 `mcpServers.wb_ops` 声明、宿主 MCP 管理器起进程注册。已验：清单 `plugin validate` ✔、安装树入口真实跑通（`initialize` → `tools/list` → `tools/call`，见 `test/probe-installed-mcp.mjs`）
+- **`${CODEBUDDY_PLUGIN_ROOT}` 在 plugin mcpServers 里会被替换（bundle 反查实锤）**：`enrichWithPluginEnvironment` 对 stdio 声明做 `command`/`args`/`cwd` 三项替换并注入插件环境变量（内置插件 builtin-calendar / workbuddy-sheetagent 同法）
+- **水位数据源根因已实锤（bundle 反查）**：`$.session.usage()` 真实返回 `{context:{tokens,window,percent},rateLimits:[]}`；`window` 真算可信；`tokens` 在 mods 绑定层恒 0（数据源本身健康：transcript `providerData.usage.inputTokens` 单调递增）。断点在宿主 mods 绑定层——可向宿主报 issue
+- **大文件降级已真机验证**：用真实 21.5MB 会话文件跑 mod → `fsprobe` 得 `{"used":410003,"bytes":22666447,"truncated":true}`，与全文解析完全一致；旧错误 `transcript too big` 归零。实测 22MB 全量读 ≈115ms、内存 134MB
+- **`prompt.submit` 返回 `{text,context}` 的宿主合并行为已真机验证**：`[wb-ops 水位]` 真实注入（宿主包成 `<system-reminder>`），`session.compact` instructions 合并亦验证（`trigger:"auto"` / `mergedLen:73` / `hasRetention:true`）
+
+### ⚠️ 未验证 / 已知边界
+
+- **宿主 `persisted-output` 阈值 ≈8KB 是硬天花板**：超过它宿主先落盘，mod 看不到原文。mod 的实际收益上限 = (预算, 8KB) 区间 + 宿主未落盘的其余工具
+- **报表工具在 GUI 新会话的最终确认**：需新开对话观察 `mcp__wb_ops__report` 是否出现在工具清单（`/reload-plugins` 对 mod 引导无效，对 MCP 组件是否有效未验）
+- **`tool.call` 事件里 `e.input` 的确切字段名**（候选 `input/tool_input/arguments` + `file_path/path/filePath`，判不出即透传，不会误伤）——Read 分档已真机验证；其余工具的 input 字段名未逐个核对
+- **GUI 重启后的插件列表识别与启用点击**未验证（真机已确认 mod 会加载，即注册表三件套有效；注册表写入格式对照本机宿主自写文件复刻，install-gui.mjs 有离线装/卸单测）
+- **`WB_OPS_STATS=0` 时是否仍起 MCP 进程**：当前不联动（工具在、数据为空时如实返回「还没有记账数据」）

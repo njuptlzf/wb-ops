@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // ④ GUI 安装助手：把本仓库以「directory marketplace + 已安装插件 + 启用声明」的宿主落盘格式写入
 // ~/.workbuddy/plugins/{known_marketplaces.json,installed_plugins.json} 与 ~/.workbuddy/settings.json，
-// 并把 payload 复制到 marketplaces/ 与 cache/——形状取自本机宿主为其他插件写下的真实文件（含 sana wb-ops 的 local@ 记录）。
+// 并把 payload 复制到 marketplaces/ 与 cache/——形状取自本机宿主为其他插件写下的真实注册表文件。
 //
 // 宿主加载一个 mod 需要三处同时成立（对照宿主 bundle 的 collectModDirsWithSources /
 // getInstalledPluginsForWorkspaceState 与官方文档「插件市场」页的 runtime 投影公式）：
@@ -21,7 +21,7 @@ const HOME = process.env.WB_OPS_INSTALL_HOME || homedir();
 const ROOT = process.env.WB_OPS_GUI_ROOT || HOME + '/.workbuddy/plugins';
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const MKT = 'wb-ops-local';
-const PID = 'wb-ops'; // 注意：与 sana 的同名插件互斥——GUI 侧只保留一个 wb-ops
+const PID = 'wb-ops'; // 注意：插件名全局唯一——GUI 侧只保留一个 wb-ops
 const NOW = () => new Date().toISOString();
 
 const manifest = JSON.parse(readFileSync(join(REPO, '.codebuddy-plugin', 'plugin.json'), 'utf8'));

@@ -205,11 +205,11 @@ test('hintFor 单元：中英模式命中与未命中', () => {
   assert.equal(hintFor('all quiet on the western front'), null);
 });
 
-test('双压缩防护：已带自身或 sana35421/wb-ops 真实标记的文本透传', async () => {
+test('双压缩防护：已带自身或同类工具真实标记的文本透传', async () => {
   const h = harness({ env: HOME });
   const a = await h.bash('[wb-ops] 已省略 3 行\n' + bigText());
   assert.equal(a.out, a.r);
-  const b = await h.bash('[wb-ops 省略 999 行，可回查]\n' + bigText()); // sana MARK_OMIT 实际前缀
+  const b = await h.bash('[wb-ops 省略 999 行，可回查]\n' + bigText()); // 同类 shell-hook 工具的实际标记前缀
   assert.equal(b.out, b.r);
 });
 
