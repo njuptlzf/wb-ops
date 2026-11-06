@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { buildModel, renderHtml, sessionNames } from '../scripts/dashboard.mjs';
+import { buildModel, renderHtml, sessionNames, timelineChart } from '../scripts/dashboard.mjs';
 
 const row = (o) => ({ file: 'x.json', calls: 1, before: 0, after: 0, tokBefore: 0, tokAfter: 0, tool: 'shell', ts: '2026-11-05T10:00:00.000Z', kinds: {}, ...o });
 
@@ -84,4 +84,52 @@ test('sessionNames：真 sqlite 临时库解析；坏路径/缺表 → 空表不
   assert.deepEqual(names, { aa112233: '自动标题', bb224466: '用户改名' }); // custom_title 优先；空名丢弃
   assert.deepEqual(sessionNames(join(dir, 'nope', 'wb-ops', 'stats')), {}); // db 不存在 → 空表（../.. 必须落到没有 workbuddy.db 的目录）
   rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------------- v0.16：模型维度 + 时间轴详情 ----------------
+
+test('buildModel v0.16：events 透传过滤坏条目，models 跨会话聚合按 base 降序', () => {
+  const m = buildModel([
+    row({ file: 'a.json', tokBefore: 600, tokAfter: 150,
+      models: { 'glm-4.6': { calls: 2, tokBefore: 500, tokAfter: 120 }, 'deepseek-v4': { calls: 1, tokBefore: 100, tokAfter: 30 } },
+      events: [{ t: 1, k: 'shell', m: 'glm-4.6', tb: 400, ta: 90 }, { t: 2, k: 'read', m: 'deepseek-v4', tb: 100, ta: 30 }, { t: 3, k: 'bad' }] }),
+    row({ file: 'b.json', tokBefore: 1000, tokAfter: 200,
+      models: { 'glm-4.6': { calls: 1, tokBefore: 1000, tokAfter: 200 } },
+      events: [{ t: 4, k: 'shell', m: 'glm-4.6', tb: 1000, ta: 200 }] }),
+  ]);
+  assert.equal(m.sessions[0].sid, 'b'); // 仍按省量降序
+  assert.equal(m.sessions[0].events.length, 1);
+  assert.equal(m.sessions.find((s) => s.sid === 'a').events.length, 2, '坏事件（缺 tb/ta）被过滤');
+  assert.deepEqual(m.models.map((x) => x.model), ['glm-4.6', 'deepseek-v4']);
+  assert.equal(m.models[0].calls, 3);
+  assert.equal(m.models[0].base, 1500);
+  assert.equal(Math.round(m.models[0].pct), 79);
+});
+
+test('timelineChart：<2 事件返回空串；SVG 折线 + 悬停 tooltip + 模型名转义', () => {
+  assert.equal(timelineChart([]), '');
+  assert.equal(timelineChart([{ t: 1, k: 'shell', m: 'x', tb: 100, ta: 10 }]), '');
+  const svg = timelineChart([
+    { t: 1730000000000, k: 'shell', m: 'a<b>', tb: 400, ta: 90 },
+    { t: 1730000060000, k: 'read', m: 'glm', tb: 100, ta: 30 },
+  ]);
+  assert.match(svg, /<svg /);
+  assert.match(svg, /polyline/g);
+  assert.match(svg, /a&lt;b&gt;/, 'tooltip 里模型名转义');
+  assert.match(svg, /<title>/);
+});
+
+test('renderHtml v0.16：首页按模型累计块；旧账本 → 空态提示不报错', () => {
+  const html = renderHtml(buildModel([
+    row({ file: 'a.json', tokBefore: 500, tokAfter: 120,
+      models: { 'glm-4.6': { calls: 2, tokBefore: 500, tokAfter: 120 } },
+      events: [{ t: 1, k: 'shell', m: 'glm-4.6', tb: 400, ta: 90 }, { t: 2, k: 'read', m: 'glm-4.6', tb: 100, ta: 30 }] }),
+  ]));
+  assert.match(html, /按模型累计（全史）/);
+  assert.match(html, /glm-4\.6/);
+  assert.match(html, /<svg /, '会话详情内时间轴图');
+  assert.match(html, /时间轴详情/);
+  const old = renderHtml(buildModel([row({ file: 'b.json', tokBefore: 300, tokAfter: 100 })]));
+  assert.match(old, /按模型汇总暂无数据/, '无 models 维度 → 如实说明');
+  assert.match(old, /账本没有事件数据/, '无 events → 如实说明');
 });

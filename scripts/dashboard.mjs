@@ -37,7 +37,8 @@ export function sessionNames(statsDirPath) {
 }
 
 /** 会话行 → 展示模型：主口径优先 token，老账本（无 tok 字段）回落字节。
- *  names：sid8 → 会话名（宿主 sessions 表），缺了就纯 hash 展示。 */
+ *  names：sid8 → 会话名（宿主 sessions 表），缺了就纯 hash 展示。
+ *  v0.16：透传 events（逐压缩事件流，详情页时间轴）与 models（按模型累计，首页汇总）。 */
 export function buildModel(rows, names = {}) {
   const agg = summarize(rows);
   const sessions = rows
@@ -47,6 +48,9 @@ export function buildModel(rows, names = {}) {
       const kept = useTok ? r.tokAfter : r.after;
       const saved = base - kept;
       const sid = r.file.replace(/\.json$/, '');
+      const events = Array.isArray(r.events)
+        ? r.events.filter((e) => e && Number.isFinite(e.tb) && Number.isFinite(e.ta))
+        : [];
       return {
         ...r,
         useTok,
@@ -55,16 +59,84 @@ export function buildModel(rows, names = {}) {
         base, kept, saved,
         pct: base ? (saved / base) * 100 : 0,
         kinds: Object.entries(r.kinds || {}).sort((a, b) => ((b[1].tokBefore || b[1].before) - (a[1].tokBefore || a[1].before))),
+        events,
+        models: r.models && typeof r.models === 'object' ? r.models : {},
       };
     })
     .sort((a, b) => b.saved - a.saved || (b.ts || '').localeCompare(a.ts || ''));
   const totalBase = agg.tokBefore || agg.before;
   const totalKept = agg.tokBefore ? agg.tokAfter : agg.after;
   const maxBase = Math.max(1, ...sessions.map((s) => s.base));
-  return { agg, sessions, totalBase, totalSaved: totalBase - totalKept, totalPct: totalBase ? ((totalBase - totalKept) / totalBase) * 100 : 0, maxBase };
+  // 首页按模型汇总：跨会话合并 models（v0.16 起才有；旧账本贡献为空）
+  const mAgg = {};
+  for (const s of sessions) {
+    for (const [m, v] of Object.entries(s.models)) {
+      const a = mAgg[m] = mAgg[m] || { model: m, calls: 0, before: 0, after: 0, tokBefore: 0, tokAfter: 0 };
+      a.calls += v.calls || 0; a.before += v.before || 0; a.after += v.after || 0;
+      a.tokBefore += v.tokBefore || 0; a.tokAfter += v.tokAfter || 0;
+    }
+  }
+  const models = Object.values(mAgg)
+    .map((a) => {
+      const useTok = a.tokBefore > 0;
+      const b = useTok ? a.tokBefore : a.before, k = useTok ? a.tokAfter : a.after;
+      return { ...a, useTok, base: b, kept: k, saved: b - k, pct: b ? ((b - k) / b) * 100 : 0 };
+    })
+    .sort((a, b) => b.base - a.base);
+  return { agg, sessions, models, totalBase, totalSaved: totalBase - totalKept, totalPct: totalBase ? ((totalBase - totalKept) / totalBase) * 100 : 0, maxBase };
 }
 
 const fmtNum = (n, tok) => (tok ? '≈' + fmtTok(n) + ' tok' : fmtBytes(n));
+
+const MODEL_COLORS = ['#6fd08c', '#e5c07b', '#61afef', '#c678dd', '#e06c75', '#56b6c2', '#98c379', '#d19a66'];
+const modelColor = (i) => MODEL_COLORS[i % MODEL_COLORS.length];
+
+/** 详情页时间轴图：x=压缩次序（时间），y=tok。两条折线（原文/压缩后），逐点 tooltip 带时刻+模型。
+ *  纯 SVG 字符串（零依赖、快照/serve 通吃）。events < 2 时不出图，如实说明。 */
+export function timelineChart(events) {
+  if (!Array.isArray(events) || events.length < 2) return '';
+  const sorted = events.slice().sort((a, b) => (a.t || 0) - (b.t || 0));
+  const W = 760, H = 220, PAD = { l: 46, r: 10, t: 10, b: 22 };
+  const iw = W - PAD.l - PAD.r, ih = H - PAD.t - PAD.b;
+  const max = Math.max(...sorted.map((e) => Math.max(e.tb, e.ta)), 1);
+  const x = (i) => PAD.l + (sorted.length === 1 ? iw / 2 : (i / (sorted.length - 1)) * iw);
+  const y = (v) => PAD.t + ih - (v / max) * ih;
+  const line = (key, color, dash) =>
+    `<polyline fill="none" stroke="${color}" stroke-width="1.6"${dash ? ' stroke-dasharray="4 3"' : ''} points="${sorted.map((e, i) => `${x(i).toFixed(1)},${y(e[key]).toFixed(1)}`).join(' ')}"/>`;
+  const dots = sorted.map((e, i) =>
+    `<circle cx="${x(i).toFixed(1)}" cy="${y(e.tb).toFixed(1)}" r="2.4" fill="${colorFor(sorted, e)}"><title>${esc(fmtTs(e.t ? new Date(e.t).toISOString() : ''))} · ${esc(e.k || '?')} · ${esc(e.m || 'unknown')} · ≈${fmtTok(e.tb)}→≈${fmtTok(e.ta)} tok</title></circle>`).join('');
+  const grid = [0, 0.5, 1].map((f) => {
+    const v = Math.round(max * f);
+    return `<line x1="${PAD.l}" y1="${y(v).toFixed(1)}" x2="${W - PAD.r}" y2="${y(v).toFixed(1)}" stroke="#232c36"/><text x="${PAD.l - 6}" y="${(y(v) + 3).toFixed(1)}" text-anchor="end" font-size="10" fill="#66717c">${fmtTok(v)}</text>`;
+  }).join('');
+  const xs = [0, sorted.length - 1].map((i) => `<text x="${x(i).toFixed(1)}" y="${H - 6}" text-anchor="${i ? 'end' : 'start'}" font-size="10" fill="#66717c">${esc(fmtTs(sorted[i].t ? new Date(sorted[i].t).toISOString() : ''))}</text>`).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px" role="img" aria-label="时间轴省量图">
+${grid}${line('tb', '#8a97a5', true)}${line('ta', '#6fd08c', false)}${dots}${xs}
+<text x="${PAD.l}" y="${PAD.t + 10}" font-size="10" fill="#8a97a5">— 虚线=原文 tok ─ 实线=压缩后 tok（悬停圆点看时刻/工具/模型）</text></svg>`;
+}
+
+function colorFor(sorted, e) {
+  const models = [...new Set(sorted.map((x) => x.m || 'unknown'))];
+  return modelColor(models.indexOf(e.m || 'unknown'));
+}
+
+/** 会话详情（卡片内 <details> 展开）：时间轴图 + 按模型小表 + 封顶说明。 */
+function sessionDetail(s) {
+  if (!s.events.length) {
+    return `<div class="legend">逐事件时间轴与模型维度自 v0.16 起记录——这个会话的账本没有事件数据（升级后新发生的压缩才会出现）。</div>`;
+  }
+  const rows = Object.entries(s.models)
+    .map(([m, v]) => {
+      const vt = (v.tokBefore || 0) > 0;
+      const b = vt ? v.tokBefore : v.before, a = vt ? v.tokAfter : v.after;
+      return `<tr><td>${esc(m)}</td><td>${v.calls || 0}</td><td>${fmtNum(b, vt)}</td><td>${fmtNum(a, vt)}</td><td>${b ? Math.round(((b - a) / b) * 100) : 0}%</td></tr>`;
+    })
+    .join('');
+  const capped = s.events.length >= 300 ? '（事件流封顶最近 300 次，更早的只进累计）' : '';
+  return `${timelineChart(s.events)}
+<table class="mt"><tr><th>模型</th><th>次数</th><th>原文</th><th>压缩后</th><th>省</th></tr>${rows}</table>
+<div class="legend">上图按事件时刻排序${capped}；下表是该会话的模型累计（全史）。</div>`;
+}
 
 function fmtTs(ts) {
   if (!ts) return '';
@@ -90,11 +162,12 @@ function sessionCard(s, maxBase) {
   <div class="bar"><div class="seg all" style="width:${wBase.toFixed(1)}%" title="原文 ${fmtNum(s.base, s.useTok)}"><div class="seg kept" style="width:${(s.base ? (s.kept / s.base) * 100 : 0).toFixed(1)}%" title="压缩后 ${fmtNum(s.kept, s.useTok)}"></div></div></div>
   <div class="legend">原文 ${fmtNum(s.base, s.useTok)} → 压缩后 ${fmtNum(s.kept, s.useTok)}（深色=留在上下文，浅色=省掉）${s.useTok ? '' : ' · 旧账本无 tok 字段，按字节'}</div>
   <div class="chips">${chips}</div>
+  <details class="dt"><summary>时间轴详情（v0.16）</summary>${sessionDetail(s)}</details>
 </div>`;
 }
 
 export function renderHtml(model, meta = {}) {
-  const { agg, sessions, totalSaved, totalPct, maxBase } = model;
+  const { agg, sessions, models, totalSaved, totalPct, maxBase } = model;
   const tokFirst = agg.tokBefore > 0;
   const head = tokFirst
     ? `累计省 <b>≈${fmtTok(totalSaved)} tok</b>（${totalPct.toFixed(1)}%） · 原文 ≈${fmtTok(agg.tokBefore)} tok → 压缩后 ≈${fmtTok(agg.tokAfter)} tok`
@@ -102,6 +175,11 @@ export function renderHtml(model, meta = {}) {
   const body = sessions.length
     ? sessions.map((s) => sessionCard(s, maxBase)).join('\n')
     : `<div class="card empty">还没有记账数据。WB_OPS_STATS 默认开（设 0/off 关）；先让 wb 里发生一次超预算的工具输出，再刷新本页。</div>`;
+  // 首页按模型汇总（v0.16）：数据来自各会话 stats 的 models 累计；旧账本没有该维度，如实说明。
+  const modelsBlock = models.length
+    ? `<div class="card"><div class="row"><b>按模型累计（全史）</b><span class="meta">跨 ${sessions.length} 个会话；与顶部累计的差异 = 旧账本未记模型的量</span></div>
+<table class="mt"><tr><th>模型</th><th>次数</th><th>原文</th><th>压缩后</th><th>省</th></tr>${models.map((m) => `<tr><td><span class="dot" style="background:${modelColor(models.indexOf(m))}"></span>${esc(m.model)}</td><td>${m.calls}</td><td>${fmtNum(m.base, m.useTok)}</td><td>${fmtNum(m.kept, m.useTok)}</td><td><b>${m.pct.toFixed(0)}%</b></td></tr>`).join('')}</table></div>`
+    : (sessions.length ? `<div class="card empty">按模型汇总暂无数据——模型维度自 v0.16 起记录，现有账本都是旧格式；新会话压缩后刷新即出现。</div>` : '');
   return `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>wb-ops 省量看板</title>
@@ -131,6 +209,14 @@ h1{font-size:19px;margin:0 0 2px}
 .chips{margin-top:8px;display:flex;gap:6px;flex-wrap:wrap}
 .chip{background:#20282f;border:1px solid #2c3742;border-radius:20px;padding:2px 10px;font-size:12px;color:#b7c2cd}
 .empty{text-align:center;color:#8a97a5;padding:32px}
+.mt{border-collapse:collapse;margin:8px 0;font-size:13px}
+.mt th,.mt td{border:1px solid #2c3742;padding:3px 10px;text-align:right}
+.mt th{background:#20282f;color:#b7c2cd;font-weight:600}
+.mt td:first-child{text-align:left}
+.mt .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:1px}
+details.dt{margin-top:10px;border-top:1px dashed #2c3742;padding-top:8px}
+details.dt summary{cursor:pointer;color:#61afef;font-size:13px;user-select:none}
+details.dt[open] summary{margin-bottom:8px}
 .foot{color:#66717c;font-size:12px;margin-top:18px}
 code{background:#20282f;padding:1px 5px;border-radius:4px}
 </style></head><body>
@@ -143,6 +229,7 @@ code{background:#20282f;padding:1px 5px;border-radius:4px}
   <div class="t"><b>${fmtBytes(agg.before)}</b>原文字节</div>
   <div class="t"><b>${fmtBytes(agg.after)}</b>压缩后字节</div>
 </div>
+${modelsBlock}
 ${body}
 <div class="foot">口径：token 为估算（与宿主 TokenUtils 同公式 ceil(中文/1.8)+ceil(其余/4)），只计 wb-ops Mod 实际改写的工具输出；模型回复、用户输入、系统提示不在内。被裁原文在 <code>${esc((meta.dir || '').replace(/[\\/]stats$/, ''))}/spill/</code> 可回查。</div>
 </body></html>`;

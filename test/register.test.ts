@@ -56,6 +56,13 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
         if (opts.usageFail) throw new Error('usage unavailable');
         return opts.usage;
       },
+      // v0.16：默认提供 model()（宿主 GUI 有 session.model 事件）；modelNoApi 模拟不支持，modelThrows 模拟 deny 抛错
+      ...(opts.modelNoApi ? {} : {
+        model: async () => {
+          if (opts.modelThrows) throw new Error('deny($.session.model)');
+          return opts.model ?? 'test-model';
+        },
+      }),
     },
   };
   const firePrompt = async (text = '继续') => {
@@ -433,6 +440,47 @@ test('WB_OPS_STATS 未设（v0.13 默认开）：写计数并带 token 口径，
   assert.ok(j.kinds.shell.tokBefore > 0, '按类也带 token');
   const txt = (out as any).result as string;
   assert.match(txt, /≈[\d.]+k? tok → ≈[\d.]+k? tok（省 \d+%）/, '标记行内联 token 与省比');
+});
+
+test('v0.16 记账：模型维度 + 每压缩事件流', async () => {
+  const h = harness({ env: { ...HOME, WB_OPS_STATS: undefined }, model: 'glm-4.6' });
+  await h.bash(bigText());
+  const j = JSON.parse(h.writes.find((w) => w.path.includes('/stats/'))!.text);
+  assert.equal(j.models['glm-4.6'].calls, 1);
+  assert.ok(j.models['glm-4.6'].tokBefore > j.models['glm-4.6'].tokAfter, '模型累计带 token');
+  assert.equal(j.events.length, 1);
+  assert.equal(j.events[0].m, 'glm-4.6');
+  assert.equal(j.events[0].k, 'shell');
+  assert.ok(Number.isFinite(j.events[0].t) && j.events[0].tb > 0 && j.events[0].ta > 0, '事件带时刻与两端 token');
+});
+
+test('v0.16 记账：model 缺失/deny 抛错 → unknown，不影响记账', async () => {
+  const h1 = harness({ env: { ...HOME, WB_OPS_STATS: undefined }, modelNoApi: true });
+  await h1.bash(bigText());
+  const j1 = JSON.parse(h1.writes.find((w) => w.path.includes('/stats/'))!.text);
+  assert.equal(j1.models.unknown.calls, 1);
+  assert.equal(j1.events[0].m, 'unknown');
+  const h2 = harness({ env: { ...HOME, WB_OPS_STATS: undefined }, modelThrows: true });
+  await h2.bash(bigText());
+  const j2 = JSON.parse(h2.writes.find((w) => w.path.includes('/stats/'))!.text);
+  assert.equal(j2.models.unknown.calls, 1, 'deny 抛错也归 unknown，主流程照常记账');
+});
+
+test('v0.16 记账：事件流封顶 300，累计不受影响', async () => {
+  const path = 'C:/tmp-home/.workbuddy/wb-ops/stats/deadbeef.json';
+  const seed = {
+    calls: 300, before: 1000, after: 100, tokBefore: 2000, tokAfter: 200, kinds: {},
+    models: { 'glm-4.6': { calls: 300, before: 1000, after: 100, tokBefore: 2000, tokAfter: 200 } },
+    events: Array.from({ length: 300 }, (_, i) => ({ t: i, k: 'shell', m: 'glm-4.6', tb: 6, ta: 1 })),
+  };
+  const h = harness({ env: { ...HOME, WB_OPS_STATS: undefined }, files: { [path]: JSON.stringify(seed) }, model: 'glm-4.6' });
+  await h.bash(bigText());
+  const j = JSON.parse(h.writes.find((w) => w.path.includes('/stats/'))!.text);
+  assert.equal(j.events.length, 300);
+  assert.equal(j.events[0].t, 1, '最老一条被挤出（slice(-300)）');
+  assert.equal(j.events[299].tb, j.tokBefore - 2000, '新事件在尾部（tb=本次 tokBefore）');
+  assert.equal(j.calls, 301);
+  assert.equal(j.models['glm-4.6'].calls, 301, '封顶只裁事件，模型累计走全史');
 });
 
 test('记账读失败不影响压缩（fail-open）', async () => {

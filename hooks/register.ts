@@ -564,6 +564,13 @@ async function recordStats($: any, home: string, sid: string, tool: string, befo
       const txt = typeof v === 'string' ? v : v && typeof (v as { text?: unknown }).text === 'string' ? (v as { text: string }).text : '';
       if (txt) cur = { ...cur, ...(JSON.parse(txt) as Record<string, any>) };
     } catch { /* 首次 */ }
+    // v0.16 模型维度：宿主 bundle 有 session.model 事件（i.model?.()，拿不到会 deny 抛错）。
+    // 任何异常/缺失一律记 'unknown'——纯观测件，绝不反噬主流程。
+    let model = 'unknown';
+    try {
+      const m = await ($.session && typeof $.session.model === 'function' ? $.session.model() : null);
+      if (typeof m === 'string' && m.trim()) model = m.trim().slice(0, 64);
+    } catch { /* deny/不支持 → unknown */ }
     cur.calls = (cur.calls || 0) + 1;
     cur.before = (cur.before || 0) + before;
     cur.after = (cur.after || 0) + after;
@@ -573,6 +580,16 @@ async function recordStats($: any, home: string, sid: string, tool: string, befo
     const kk = cur.kinds[tool] = cur.kinds[tool] || { calls: 0, before: 0, after: 0, tokBefore: 0, tokAfter: 0 };
     kk.calls++; kk.before += before; kk.after += after;
     kk.tokBefore = (kk.tokBefore || 0) + beforeTok; kk.tokAfter = (kk.tokAfter || 0) + afterTok;
+    // ② v0.16 按模型累计（全史）——首页「按模型」汇总用这个，不受事件封顶影响
+    cur.models = cur.models || {};
+    const mm = cur.models[model] = cur.models[model] || { calls: 0, before: 0, after: 0, tokBefore: 0, tokAfter: 0 };
+    mm.calls++; mm.before += before; mm.after += after;
+    mm.tokBefore += beforeTok; mm.tokAfter += afterTok;
+    // ③ v0.16 每压缩事件流（详情页时间轴图用）。
+    // ponytail: 封顶 300 条保热路径整读整写 ~30KB 量级；升级路径 = append-only JSONL + 尾读。
+    cur.events = Array.isArray(cur.events) ? cur.events : [];
+    cur.events.push({ t: Date.now(), k: tool, m: model, tb: beforeTok, ta: afterTok });
+    if (cur.events.length > 300) cur.events = cur.events.slice(-300);
     await $.fs.write(path, JSON.stringify({ ...cur, tool, ts: new Date().toISOString() }));
   } catch { /* 记账失败不影响主流程 */ }
 }
