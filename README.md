@@ -117,6 +117,7 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" pl
 node --test test/register.test.ts test/dashboard.test.mjs   # 128 项，全绿
 node test/benchmark.mjs                                      # 保真度门禁（9 夹具）
 node test/audit-tiers.mjs --from-ledger                      # 漏压归因（只读账本，不扫 transcript）
+node test/acceptance-skip-ledger.mjs                         # 真机验收（ACP 驱动真实宿主）
 bash test/run-acceptance.sh <合法UUID> "验收" WB_OPS_GUARD_PCT=10   # 真机验收触发器
 ```
 
@@ -126,6 +127,11 @@ bash test/run-acceptance.sh <合法UUID> "验收" WB_OPS_GUARD_PCT=10   # 真机
 账本按 (分档, 原因) 聚合计数，原因分三档：设计使然 / 性能 / **疑似缺口**
 （`no-path`、`shape-unknown`——真出现就要查判据）。
 `--from-ledger` 直接读它出归因表，不用翻 transcript。口径见 [docs/ALGORITHMS.md §7](docs/ALGORITHMS.md)。
+
+**真机验收**：`test/acceptance-skip-ledger.mjs` 走宿主 CLI 的 ACP 模式（HTTP+SSE），
+在真实宿主里驱动工具调用，验证账本落盘且不含正文。
+退出码三态：`0` 通过 / `2` **未验证**（宿主账号鉴权挡住 CLI 会话创建）/ `1` 失败——
+绝不把"没验成"报成"验过了"。详见 [docs/VERIFICATION.md §9.6](docs/VERIFICATION.md)。
 
 沙箱纪律：mods 内禁止 `node:require/process/global`（引擎会当场拒绝整个 mod）；所有宿主能力走 `$` 命名空间。
 

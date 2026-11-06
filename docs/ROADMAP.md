@@ -64,6 +64,14 @@ assertion/错误/异常/崩溃/致命`）的行，在预算内顺带保留其后
       归因成本从「翻 7500 条 transcript」降到「读一条账本」。
       单测 115 → **128** 全绿（新增 13 项，含「账本绝不含正文」「预算内不记账」
       「聚合语义」「行数口径与 split 一致」）；详见 [VERIFICATION.md §9](VERIFICATION.md#9-v018compress-skipped-诊断出口p0-收口2026-11-06)。
+      **真机验证边界（如实标注）**：0.18.0 的 mod 已在真实宿主里加载成功
+      （含 `tool.call` 钩子注册）、ACP 握手完整成功、新代码在真实宿主里写盘正常；
+      但**账本在真机上的落盘未验证**——宿主账号鉴权挡住 CLI 侧会话创建
+      （`session/new` 与 `session/load` 均撞 `Authentication required`，与 v0.17 §8.5 结论一致，
+      本次二次确认）。验收脚本 `test/acceptance-skip-ledger.mjs` 退出码三态
+      （`0` 通过 / `2` 未验证 / `1` 失败），**不把"没验成"报成"验过了"**。
+      补验方式见 [VERIFICATION.md §9.6](VERIFICATION.md#96-真机验证走到哪一步为什么没走完)：
+      开新 GUI 会话触发一次 Read 行数门场景，再跑 `node test/audit-tiers.mjs --from-ledger`。
 - [ ] **报表工具在 GUI 新会话的最终确认**——需新开对话观察 `mcp__wb_ops__report` 是否出现在
       工具清单（`/reload-plugins` 对 mod 引导有效，对 MCP 组件是否有效未验）。
       **验收**：新会话工具清单截图 + 一次实际调用成功。

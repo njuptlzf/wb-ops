@@ -625,7 +625,52 @@ transcript 反查是**事后猜**的，账本是**当下决定**的，两者应�
 
 **benchmark**：9 夹具全部门禁通过，合计省量 85.6%（与 v0.17 持平——本改动不触碰压缩算法，只加观测）。
 
-### 9.6 这次改动的取舍
+### 9.6 真机验证：走到哪一步，为什么没走完
+
+新增 `test/acceptance-skip-ledger.mjs`——它想在**真实宿主**上验证账本落盘。
+这条路的关键在于绕开"模型回合"：CLI 的 `-p` 模式必须跑模型回合，而 CLI 侧
+鉴权不可用（`Authentication required`）——没有模型回合就没有工具调用，
+`tool.call` 钩子也就不会触发。
+
+于是改走宿主 CLI 的 **ACP 模式**（`--acp`，HTTP + SSE）。ACP 客户端可以自己驱动
+工具调用，绕开模型回合。协议形态从宿主 bundle 的 `acp/connect` 实现反查得到：
+`POST /api/v1/acp/connect` → `POST /api/v1/acp`（带 `acp-connection-id` /
+`acp-session-token` 头）→ `GET /api/v1/acp`（SSE 事件流）。
+
+**已验证（真机，真实宿主）**：
+
+| 项 | 证据 |
+|---|---|
+| 0.18.0 的 mod 在真实宿主里加载成功 | 宿主启动日志：`mods: loaded mod "wb-ops" from .codebuddy-plugin (tier user, hooks: tool.call prompt.submit session.compact)` |
+| 宿主沙箱接受新代码 | 同上——沙箱违规会当场拒绝整个 mod（禁用 `node:require/process/global`），加载成功即合规 |
+| ACP 握手完整成功 | `acp/connect` → `connectionId`；`initialize` → `protocolVersion: 1` + 完整 `agentCapabilities`（含 `delegateToolsSupport`） |
+| 新代码在真实宿主里执行并写盘 | CLI 会话产出 `debug/fsprobe-<sid>.json`、`debug/usage-<sid>.json`（新 `register.ts` 的 `prompt.submit` 链路真实运行） |
+| 安装树内容与仓库一致 | `cache/wb-ops-local/wb-ops/0.18.0/hooks/register.ts` 与 `marketplaces/.../hooks/register.ts` 均与仓库逐字相同（`diff -q` 通过） |
+
+**未验证（如实标注）**：**跳过账本在真实宿主上的落盘**。
+
+原因明确且不可绕：`session/new` 被宿主账号鉴权挡住（`Authentication required`,
+`category: auth`）。宿主 GUI 的账号态不在 CLI 的配置目录里，CLI 拿不到——
+`session/load` 同样撞这道门（补齐 `mcpServers` 参数后错误从 `Invalid params`
+变成 `Authentication required`，已实测）。这与 v0.17 §8.5 的结论一致，本次**二次确认**。
+
+因此验收脚本的退出码是三态，**不把"没验成"包装成"验过了"**：
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 账本已按预期落盘，且**不含工具输出正文**（硬纪律核验通过） |
+| **2** | **未验证**——宿主鉴权挡住，tool.call 未触发（已验证部分照常打印） |
+| 1 | 其他失败（附 stderr 片段） |
+
+**补验方式**：开一个新的 GUI 会话（mod 在会话启动时加载，cache 已是 0.18.0），
+触发一次"超预算却没被压缩"的工具调用（如 Read 一个 1400 行的源码文件——
+源码档 <1500 行不裁，必然命中行数门），然后：
+
+```bash
+node test/audit-tiers.mjs --from-ledger      # 归因表应出现 read/lines-gate
+```
+
+### 9.7 这次改动的取舍
 
 - **只加观测，不动压缩算法**：压缩率、标记格式、落盘策略一律不变。
   benchmark 的省量数字与 v0.17 完全一致（85.6%），可作为"没碰算法"的旁证。
