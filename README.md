@@ -1,6 +1,6 @@
 # wb-ops
 
-[![version](https://img.shields.io/badge/version-0.16.0-blue)](.codebuddy-plugin/plugin.json)
+[![version](https://img.shields.io/badge/version-0.17.0-blue)](.codebuddy-plugin/plugin.json)
 [![tests](https://img.shields.io/badge/tests-109%20passing-brightgreen)](#-开发与测试)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.5-green)](#-安装)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](#-安装)
@@ -127,6 +127,7 @@ bash test/run-acceptance.sh <合法UUID> "验收" WB_OPS_GUARD_PCT=10   # 真机
 | [docs/ALGORITHMS.md](docs/ALGORITHMS.md) | 算法说明：各出口的省量算法、阈值与 token 估算口径 |
 | [docs/BENCHMARK.md](docs/BENCHMARK.md) | 保真度 benchmark：压缩后上下文是否失真？方法论与结果（`node test/benchmark.mjs` 可复跑，兼作回归门禁） |
 | [docs/DESIGN.md](docs/DESIGN.md) | 设计文档：为什么是 Mod、热路径性能纪律、记账三元组、诊断通道、宿主形状实测 |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | 路线图：公开待办清单（P0/P1/P2 分级，含验收方式） |
 | [docs/VERIFICATION.md](docs/VERIFICATION.md) | 验证报告：真机验收流程、原始数据、复现命令、已验证/未验证清单 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录 |
 

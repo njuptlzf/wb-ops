@@ -321,6 +321,38 @@ test('均匀撒点：关键行密集时不超过 40 条', () => {
   assert.ok(parseInt(m![1], 10) <= 40, `实际 ${m![1]} 条`);
 });
 
+test('锚点扩行：FATAL 行后的堆栈帧进上下文（不含关键词的帧）', () => {
+  const lines = Array.from({ length: 900 }, (_, i) => `req ${i} heartbeat`);
+  lines[450] = 'FATAL: unhandled rejection in worker pool';
+  for (let k = 0; k < 4; k++) lines[451 + k] = `    at Worker.run (/srv/worker.js:${120 + k}:22)`;
+  lines[470] = '[ERROR] pool drained: 0 healthy of 4 workers';
+  const out = compress(lines.join('\n'), 8000, 100, null)!;
+  assert.ok(out.text.includes('FATAL: unhandled rejection'), 'FATAL 行在');
+  for (let k = 0; k < 4; k++) {
+    assert.ok(out.text.includes(`at Worker.run (/srv/worker.js:${120 + k}:22)`), `堆栈帧 ${k} 在`);
+  }
+  assert.ok(out.text.includes('[ERROR] pool drained'), 'ERROR 行在');
+});
+
+test('锚点扩行有护栏：满屏错误不会无限扩行', () => {
+  const lines = Array.from({ length: 5000 }, (_, i) => `ERROR e${i}`);
+  const out = compress(lines.join('\n'), 8000, 100, null)!;
+  const m = /命中关键行 \((\d+)\)/.exec(out.text);
+  assert.ok(m, '有关键行段');
+  assert.ok(parseInt(m![1], 10) <= 40, `实际 ${m![1]} 条`);
+  assert.ok(byteLen(out.text) <= 8000 + 1400, '预算内');
+});
+
+test('锚点扩行不挤掉尾部：Exit Code 行仍在', () => {
+  const lines = Array.from({ length: 3000 }, (_, i) => `req ${i} ok`);
+  lines[1000] = 'FATAL: boom';
+  for (let k = 0; k < 4; k++) lines[1001 + k] = `    at Frame${k} (/srv/x.js:${k}:1)`;
+  lines.push('Exit Code: 0');
+  const out = compress(lines.join('\n'), 8000, 100, null)!;
+  assert.ok(out.text.includes('Exit Code: 0'), '尾部退出码仍在');
+  assert.ok(out.text.includes('at Frame0'), '锚点帧仍在');
+});
+
 // ---------------------------------------------------------------- Batch A：分工具策略
 
 test('Grep JSON 数组：前 K 条 + 计数 + .json 落盘', async () => {

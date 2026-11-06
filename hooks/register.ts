@@ -39,6 +39,11 @@ const TX_TAIL_CHARS = 4_000_000;             // transcript 超大时只解析尾
 const LINE_MAX_BYTES = 1000;                 // 单行展示上限（防 minified 巨行吃满预算）
 const KEY_MAX_LINES = 40;                    // 中段捞回上限，超出均匀抽样
 const KEY_POOL_MAX = 4000;                   // 命中爆炸护栏：池满即用已有部分
+const ANCHOR_AFTER = 4;                     // 锚点扩行：严重错误行后顺带保留的连续行数（堆栈帧）
+const ANCHOR_MAX = 60;                      // 锚点扩行总量护栏（防止满屏错误时无限扩）
+const KEY_BYTE_SHARE = 0.42;                // 关键行可占预算的最大比例（其余留给头尾与标记）
+// 严重错误锚点：命中这些的行会额外带上后续上下文行（堆栈帧/调用链）
+const SEVERE = /(fatal|exception|traceback|panic|segmentation|core dumped|abort|assertion|\berror\b|错误|异常|崩溃|致命)/i;
 const GAP_HINT_MIN_LINES = 20;               // 空洞指路门槛
 const GAP_HINT_MAX_LIMIT = 180;              // 指路 limit 上限：太大又会被同一道门槛裁一次
 const READ_HEAD_MIN = 20, READ_HEAD_MAX = 400, READ_TAIL_MIN = 10, READ_TAIL_MAX = 300;
@@ -325,6 +330,34 @@ function hitKey(line: string, skeleton: string): boolean {
 }
 
 /**
+ * 关键行字节配额裁剪：把选中行按「连续块」分组，锚点块（错误行及其堆栈帧）优先保留，
+ * 放不下的普通块整块丢弃（保持块内连续——半块堆栈帧没有意义）。
+ * 目的：关键行独占预算会把尾部挤出预算，触发硬截断丢掉 Exit Code 行。
+ */
+function trimKeyToBudget(idx: number[], anchorSet: Set<number>, cap: number, cost: (i: number) => number): number[] {
+  if (!idx.length) return idx;
+  const bytes = (arr: number[]) => arr.reduce((s, i) => s + cost(i), 0);
+  if (bytes(idx) <= cap) return idx;
+  const blocks: number[][] = [];
+  for (const i of idx) {
+    const last = blocks[blocks.length - 1];
+    if (last && last[last.length - 1] === i - 1) last.push(i);
+    else blocks.push([i]);
+  }
+  const ordered = blocks
+    .map((b, k) => ({ b, k, p: b.some((i) => anchorSet.has(i)) ? 0 : 1 }))
+    .sort((x, y) => x.p - y.p || x.k - y.k);
+  const kept: number[][] = [];
+  let used = 0;
+  for (const { b } of ordered) {
+    const c = bytes(b);
+    if (used + c > cap && kept.length) continue;  // 整块丢弃，不切半块
+    kept.push(b); used += c;
+  }
+  return kept.flat().sort((a, b) => a - b);
+}
+
+/**
  * 纯函数压缩核心。返回 null = 放弃（调用方透传原文）。
  * opts.mode：shell（退出码门）| read（行数门槛+硬阀+空洞指路）| doc（标题/链接行命中）。
  */
@@ -371,13 +404,28 @@ export function compress(
   // 中段关键行池（deadline 每 512 行一查）
   const skeleton = opts?.skeleton ?? 'keyword';
   const pool: number[] = [];
+  const anchors: number[] = [];   // 锚点扩行：严重错误行之后的连续上下文（堆栈帧）
+  const anchorSet = new Set<number>();
+  let anchorLeft = ANCHOR_MAX;
   for (let i = 0; i < total; i++) {
     if ((i & 511) === 0 && Date.now() - start >= deadlineMs) return null;
     const l = lines[i];
     if (l.length > 0 && hitKey(l, skeleton)) {
       pool.push(i);
+      // 锚点扩行：错误行本身命中了，但它的上下文行（如 `    at Worker.run (…)` 堆栈帧）
+      // 不含关键词——排查失败时缺了它们等于缺了半张现场。严重错误行后顺带保留若干行。
+      if (anchorLeft > 0 && SEVERE.test(l)) {
+        for (let k = 1; k <= ANCHOR_AFTER && i + k < total && anchorLeft > 0; k++) {
+          anchors.push(i + k); anchorSet.add(i + k); anchorLeft--;
+        }
+      }
       if (pool.length >= KEY_POOL_MAX) break; // 命中爆炸：用已有池，不再扫
     }
+  }
+  if (anchors.length) {
+    // 合并去重并按行号排序（锚点可能与后续命中重叠或乱序）
+    const merged = Array.from(new Set(pool.concat(anchors))).sort((a, b) => a - b);
+    pool.length = 0; pool.push(...merged);
   }
 
   const cost = (i: number) => Math.min(byteLen(lines[i]), LINE_MAX_BYTES) + 1;
@@ -397,8 +445,27 @@ export function compress(
     const mid: number[] = [];
     for (const i of pool) if (i >= headKeep && i < total - tailKeep) mid.push(i);
     if (mid.length > KEY_MAX_LINES) {
-      const step = Math.ceil(mid.length / KEY_MAX_LINES);
-      keyIdx = mid.filter((_, j) => j % step === 0); // 均匀撒点（连续段等于没省）
+      // 按「连续块」抽样而不是逐行撒点：锚点扩行产生的连续帧（堆栈/调用链）被均匀
+      // 撒点打散后，每帧单独一行就失去意义——块要整块留，块内再均匀采样。
+      const blocks: number[][] = [];
+      for (const i of mid) {
+        const last = blocks[blocks.length - 1];
+        if (last && last[last.length - 1] === i - 1) last.push(i);
+        else blocks.push([i]);
+      }
+      const bStep = Math.max(1, Math.ceil(blocks.length / KEY_MAX_LINES));
+      const nSel = Math.ceil(blocks.length / bStep);
+      const perBlock = Math.max(1, Math.floor(KEY_MAX_LINES / nSel));
+      const sel: number[] = [];
+      for (let b = 0; b < blocks.length && sel.length < KEY_MAX_LINES; b += bStep) {
+        const bl = blocks[b];
+        if (bl.length <= perBlock) sel.push(...bl);
+        else {
+          const step = bl.length / perBlock;          // 块内均匀采样（连续块过长时）
+          for (let k = 0; k < perBlock; k++) sel.push(bl[Math.floor(k * step)]);
+        }
+      }
+      keyIdx = sel;
     } else keyIdx = mid;
     if (mode === 'shell') {
       // Exit Code 行保底：命令失败现场已透传，能走到这说明它是 0——但这行必须可见，
@@ -408,6 +475,9 @@ export function compress(
       }
       keyIdx = keyIdx.filter((i) => i >= headKeep && i < total - tailKeep); // 尾段扩张后去重
     }
+    // 关键行字节配额：锚点扩行后关键行可能独占预算，把尾部挤出预算 → 尾部硬截断会丢掉
+    // Exit Code 行（模型就不知道成没成）。配额内优先保锚点块，其余整块丢弃。
+    keyIdx = trimKeyToBudget(keyIdx, anchorSet, budget * KEY_BYTE_SHARE, cost);
     let u = 0;
     for (let i = 0; i < headKeep; i++) u += cost(i);
     for (let i = total - tailKeep; i < total; i++) u += cost(i);

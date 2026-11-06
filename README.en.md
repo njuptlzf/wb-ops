@@ -1,6 +1,6 @@
 # wb-ops
 
-[![version](https://img.shields.io/badge/version-0.16.0-blue)](.codebuddy-plugin/plugin.json)
+[![version](https://img.shields.io/badge/version-0.17.0-blue)](.codebuddy-plugin/plugin.json)
 [![tests](https://img.shields.io/badge/tests-109%20passing-brightgreen)](#-development)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.5-green)](#-installation)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](#-installation)
@@ -90,7 +90,10 @@ bash test/run-acceptance.sh <uuid> "acceptance" WB_OPS_GUARD_PCT=10
 
 | Doc | Contents |
 |---|---|
+| [docs/ALGORITHMS.md](docs/ALGORITHMS.md) | Algorithms: per-exit savings algorithms, thresholds, token estimation rules |
+| [docs/BENCHMARK.md](docs/BENCHMARK.md) | Fidelity benchmark: does compression distort context? Method and results (`node test/benchmark.mjs`) |
 | [docs/DESIGN.md](docs/DESIGN.md) | Design rationale: why a Mod, hot-path discipline, accounting triple, diagnostics, host shape findings |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Roadmap: public backlog, prioritized P0/P1/P2, with acceptance criteria |
 | [docs/VERIFICATION.md](docs/VERIFICATION.md) | Verification report: real-machine acceptance, raw data, reproduction commands |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes |
 

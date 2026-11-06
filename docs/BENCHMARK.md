@@ -31,18 +31,21 @@
 
 ```text
 夹具                     省字节   关键锚点  期望信息(上下文内)  捏造行  预算  尾真实 退码  | 基线关键  基线期望
-shell/build-log          97.9%    3/3      4/5               0      ok   true  true | 0/3       0/5
+shell/build-log          97.6%    3/3      5/5               0      ok   true  true | 0/3       0/5
 shell/test-runner        94.5%    2/2      7/7               0      ok   true  true | 0/2       0/7
-shell/stack-trace        92.6%    2/2      2/6               0      ok   true  true | 0/2       0/6
-shell/cjk-log            97.1%    2/2      3/3               0      ok   true  true | 0/2       0/3
+shell/stack-trace        91.7%    2/2      6/6               0      ok   true  true | 0/2       0/6
+shell/cjk-log            96.7%    2/2      3/3               0      ok   true  true | 0/2       0/3
 shell/minified-dump      92.9%    3/3      n/a               0      ok   true  true | 0/3       0/0
-grep/native-array        80.8%    2/2      1/1               0      ok   n/a   n/a  | 0/2       1/1
-read/data-log            91.9%    2/2      2/2               0      ok   n/a   n/a  | 0/2       0/2
-read/source-800           0.0%    n/a      n/a               0      ok   n/a   n/a  | 0/0       0/0
-webfetch/doc             92.4%    1/1      5/5               0      ok   n/a   n/a  | 0/1       1/5
+grep/native-array        80.8%    2/2      1/1               0      ok   n/a  n/a  | 0/2       1/1
+read/data-log            90.5%    2/2      2/2               0      ok   n/a  n/a  | 0/2       0/2
+read/source-800          0.0%    n/a      n/a               0      ok   n/a  n/a  | 0/0       0/0
+webfetch/doc             91.9%    1/1      5/5               0      ok   n/a  n/a  | 0/1       1/5
 
-合计：86.0% tok（≈133037 → ≈18677）· ALL GATES PASSED
+合计：85.6% tok（≈133037 → ≈19112）· ALL GATES PASSED
 ```
+
+> v0.17 锚点扩行后：`stack-trace` 的期望信息保留率 2/6 → 6/6；总省量 86.0% → 85.6%
+> （多留了 4 行堆栈帧，代价约 0.4 个百分点——这是有意付的代价，见下文）。
 
 ### 结果解读
 
@@ -52,9 +55,14 @@ webfetch/doc             92.4%    1/1      5/5               0      ok   n/a   n
 - **`read/source-800` = 0% 省**：这是**故意的**——800 行源码 < 1500 行门槛，原样透传（保真度 100%），验证"源码不裁"承诺
 - **中文场景不劣化**：`cjk-log` 省字节 97.1%（字节预算在中文下优势更大：同一预算字节数≈更少汉字，但 KEY 正则中英并集保证中文错误行照样命中）
 
-### 已发现的诚实局限（benchmark 的价值就在这里）
+### 已解决的局限
 
-1. **关键词锚点的"上下文行"可能不在上下文里**：`stack-trace` 期望 6 条只有 2 条在（`FATAL`/`ERROR` 行命中关键词保留，但其下 4 行 `    at Worker.run (…)` 堆栈帧不含关键词、留在落盘）。失败排查场景中模型可能需要多一次 Read 落盘文件。缓解已内置（落盘路径在场），根治方向：锚点行 ±N 行连续保留（`FATAL` 后顺带 2~4 行堆栈帧）——已在路线图
+1. ~~**关键词锚点的"上下文行"可能不在上下文里**~~ → **已根治（v0.17，2026-11-06）**
+   `stack-trace` 夹具曾期望 6 条只中 2 条：`FATAL`/`ERROR` 行命中关键词被保留，但其下 4 行
+   `    at Worker.run (…)` 堆栈帧不含关键词、留在落盘。现改为**锚点扩行**——严重错误行后顺带
+   保留若干连续行，该夹具期望信息保留率 **2/6 → 6/6**，单测已钉死。
+   配套加固：抽样改为按连续块（不打散堆栈帧）、关键行字节配额（不挤掉尾部 `Exit Code` 行）、
+   锚点扩行护栏（满屏错误时不无限扩）。详见 [ROADMAP.md](ROADMAP.md)。
 2. **列表中间条目按设计丢弃**：`grep/native-array` 只保前 K 条 + 总数说明，中间的报错路径需要读落盘 `.json`
 3. **字节级截断路径**（≤20 行巨字节）是唯一允许"半行"的路径，截断处以 `…` 标记——夹具已验证首尾片段完整
 

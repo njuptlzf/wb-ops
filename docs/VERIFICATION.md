@@ -368,12 +368,14 @@ fs.writeFileSync(p, fs.readFileSync(p+'.wbops-bak')); fs.unlinkSync(p+'.wbops-ba
 
 ---
 
-## 7. 已验证 / 未验证清单（截至 v0.16）
+## 7. 已验证 / 未验证清单（截至 v0.17）
+
+> 未验证项的整改进度与验收方式见 [ROADMAP.md](ROADMAP.md)——本节只陈述"验没验"，路线图陈述"什么时候验、怎么验"。
 
 ### ✅ 已验证
 
 - **通配兜底的谓词 matcher（真机闭环）**：`domain_search` 输出 52.1KB → 兜底压缩生效（头部 + 命中关键行 + 尾部，`[+NNNNB]` 单行截断正常）。函数谓词每次事件重评、路由真实生效。
-- **mods 加载**（CLI 启动日志 `hooks: tool.call prompt.submit session.compact` 三通道全注册）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示、水位守卫与压缩保留指示、通配兜底、分类账本、水位数值文件、GUI 安装助手、形状诊断通道、水位数据源、token 口径、报表 MCP、Web 看板、看板会话名、模型维度与事件流——离线 mock API 单测 **109 项全绿**（`node --test test/register.test.ts test/dashboard.test.mjs`）
+- **mods 加载**（CLI 启动日志 `hooks: tool.call prompt.submit session.compact` 三通道全注册）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示、水位守卫与压缩保留指示、通配兜底、分类账本、水位数值文件、GUI 安装助手、形状诊断通道、水位数据源、token 口径、报表 MCP、Web 看板、看板会话名、模型维度与事件流——离线 mock API 单测 **112 项全绿**（v0.17 锚点扩行新增 3 项）（`node --test test/register.test.ts test/dashboard.test.mjs`）
 - **Grep/Glob 输出形状**：从 86 条真实 transcript 确认 = JSON 字符串数组；真机再测发现宿主原生形态是 `content: string[]`（不是 JSON 文本）→ 已适配（单测钉死：裁条目+单行说明、保持数组形态、预算内零影响、混合类型仍 fail-open）
 - **真机压缩闭环（GUI 会话）**：Bash 13.2KB / PowerShell 14.9KB / TaskOutput 30.4KB / Read .log 24.5KB（含 `回看: Read offset=34 limit=180` 空洞指路）/ MCP 兜底 52.1KB / 错误现场 Exit Code 2 完整透传 + `[wb-ops 提示]` 一行 / 预算内零影响 / Read .ts 682 行原样不裁——5 次 spill 落盘 135KB
 - **报表工具（v0.14 根治）**：`mcp__wb_ops__report` 由插件清单 `mcpServers.wb_ops` 声明、宿主 MCP 管理器起进程注册。已验：清单 `plugin validate` ✔、安装树入口真实跑通（`initialize` → `tools/list` → `tools/call`，见 `test/probe-installed-mcp.mjs`）
