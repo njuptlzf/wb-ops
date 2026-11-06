@@ -23,14 +23,17 @@
   | 测试 | 单测 115 → **128** 全绿（新增 13 项：四种 trace 原因 / 账本绝不含正文 / 预算内不记账 / 聚合语义 / 行数口径与 split 一致 / 写盘失败 fail-open 等）；benchmark 9 夹具门禁全通过，省量 85.6% 与 v0.17 持平（**本改动不触碰压缩算法**，只加观测） |
   | 真机验收脚本 | `test/acceptance-skip-ledger.mjs`——走宿主 CLI 的 ACP 模式（HTTP+SSE，协议形态从宿主 bundle 的 `acp/connect` 实现反查）在真实宿主里驱动工具调用。**退出码三态**：`0` 通过 / `2` **未验证**（宿主账号鉴权挡住 CLI 会话创建）/ `1` 失败——不把"没验成"报成"验过了" |
 
-  **真机验证状态（如实标注）**：0.18.0 的 mod 已在真实宿主里**加载成功**
+  **真机验证状态**：0.18.0 的 mod 已在真实宿主里**加载成功**
   （宿主日志 `mods: loaded mod "wb-ops" … hooks: tool.call prompt.submit session.compact`）、
   ACP 握手完整成功（`protocolVersion: 1` + 完整 `agentCapabilities`）、
   新代码在真实宿主里写盘正常（`fsprobe`/`usage` 诊断文件产出）、
-  安装树与仓库逐字一致。**但账本在真机上的落盘未验证**——宿主账号鉴权挡住
-  CLI 侧会话创建（`session/new` 与 `session/load` 均撞 `Authentication required`，
-  与 v0.17 §8.5 结论一致，本次二次确认）。补验方式见
-  [docs/VERIFICATION.md §9.6](docs/VERIFICATION.md#96-真机验证走到哪一步为什么没走完)。
+  安装树与仓库逐字一致。**账本真机落盘已补验（同日 GUI 新会话）**：
+  Read 一个超预算、不足源码档 1500 行门槛的文件，账本准确落下
+  `read/lines-gate` 记录（bytes/lines/path 齐全、无正文），
+  `audit-tiers.mjs --from-ledger` 归因表直接命中、退出码 0。
+  CLI 侧无人值守路径仍被宿主账号鉴权挡住（`Authentication required`，与
+  v0.17 §8.5 结论一致），验收脚本三态退出码（`0`/`2` 未验证/`1`）保留原语义。
+  详见 [docs/VERIFICATION.md §9.6](docs/VERIFICATION.md#96-真机验证边界与补验)。
 
   归因成本从「翻 7500 条 transcript」降到「读一条账本」。详见
   [docs/VERIFICATION.md §9](docs/VERIFICATION.md#9-v018compress-skipped-诊断出口p0-收口2026-11-06)。

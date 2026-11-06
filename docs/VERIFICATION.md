@@ -625,7 +625,7 @@ transcript 反查是**事后猜**的，账本是**当下决定**的，两者应�
 
 **benchmark**：9 夹具全部门禁通过，合计省量 85.6%（与 v0.17 持平——本改动不触碰压缩算法，只加观测）。
 
-### 9.6 真机验证：走到哪一步，为什么没走完
+### 9.6 真机验证：边界与补验
 
 新增 `test/acceptance-skip-ledger.mjs`——它想在**真实宿主**上验证账本落盘。
 这条路的关键在于绕开"模型回合"：CLI 的 `-p` 模式必须跑模型回合，而 CLI 侧
@@ -647,22 +647,35 @@ transcript 反查是**事后猜**的，账本是**当下决定**的，两者应�
 | 新代码在真实宿主里执行并写盘 | CLI 会话产出 `debug/fsprobe-<sid>.json`、`debug/usage-<sid>.json`（新 `register.ts` 的 `prompt.submit` 链路真实运行） |
 | 安装树内容与仓库一致 | `cache/wb-ops-local/wb-ops/0.18.0/hooks/register.ts` 与 `marketplaces/.../hooks/register.ts` 均与仓库逐字相同（`diff -q` 通过） |
 
-**未验证（如实标注）**：**跳过账本在真实宿主上的落盘**。
+**曾未验证 → 已补验（GUI 会话，2026-11-06 新会话）**：**跳过账本在真实宿主上的落盘**。
 
-原因明确且不可绕：`session/new` 被宿主账号鉴权挡住（`Authentication required`,
+上一轮卡在 CLI 侧：`session/new` 被宿主账号鉴权挡住（`Authentication required`,
 `category: auth`）。宿主 GUI 的账号态不在 CLI 的配置目录里，CLI 拿不到——
 `session/load` 同样撞这道门（补齐 `mcpServers` 参数后错误从 `Invalid params`
-变成 `Authentication required`，已实测）。这与 v0.17 §8.5 的结论一致，本次**二次确认**。
+变成 `Authentication required`，已实测）。这与 v0.17 §8.5 的结论一致，当时**二次确认**。
 
-因此验收脚本的退出码是三态，**不把"没验成"包装成"验过了"**：
+补验走的是文档里写明的正路——**GUI 新会话**（mod 在会话启动时加载 cache 0.18.0）：
 
-| 退出码 | 含义 |
-|---|---|
-| 0 | 账本已按预期落盘，且**不含工具输出正文**（硬纪律核验通过） |
-| **2** | **未验证**——宿主鉴权挡住，tool.call 未触发（已验证部分照常打印） |
-| 1 | 其他失败（附 stderr 片段） |
+| 步 | 操作 | 账本表现 |
+|---|---|---|
+| 1 | 新会话启动后正常干活（Grep 大结果、Read 源码） | `debug/skipped-<sid8>.json` **自动出现**——此前该目录下只有 usage/fsprobe |
+| 2 | 按计划触发：`Read` 一个 260 行 / 18KB 的源码文件（超 4500B 预算、不足源码档 1500 行门槛、无 `[wb-ops]` 字面量） | 账本新增 `{"kind":"read","reason":"lines-gate","bytes":18122,"lines":260,"path":"…/scripts/dashboard.mjs"}`，聚合计数 n=1 |
+| 3 | `node test/audit-tiers.mjs --from-ledger` | 归因表出现 `read/lines-gate`，疑似缺口 0，**退出码 0** |
 
-**补验方式**：开一个新的 GUI 会话（mod 在会话启动时加载，cache 已是 0.18.0），
+**纪律复核（真机数据）**：账本全文只含 kind/tool/reason/bytes/lines/path/时刻，
+**无任何工具输出正文**——与单测断言的纪律在真实宿主下同样成立。
+
+**真机第一个非预期归因（账本设计价值的直接印证）**：本次会话里 `already-marked`
+出现了 3 次（Grep×2 + Read×1），全部是**读 wb-ops 自己的源码文件**——文件内容里
+本来就有 `[wb-ops]` 字面量（测试夹具与注释），被防双压标记检查误认为"已压缩过的输出"。
+这是**已知设计**（标记检查不区分"真标记"与"恰好引用了标记的文本"），无正确性风险
+（误判方向是保守透传），但账本让它**可见**了：没有账本，这类现象只会在 transcript
+里以"没压"的面目无声出现。后续可考虑把 Read 档的标记判定收紧到"行首 + 已知标记格式"。
+
+验收脚本的三态退出码保留原语义（CLI 侧鉴权门依旧存在，`acceptance-skip-ledger.mjs`
+单独跑仍返回 2）——它验证的是**无人值守**路径；GUI 补验验证的是**功能本身**。
+
+**补验方式（留档，可复现）**：开一个新的 GUI 会话（mod 在会话启动时加载，cache 已是 0.18.0），
 触发一次"超预算却没被压缩"的工具调用（如 Read 一个 1400 行的源码文件——
 源码档 <1500 行不裁，必然命中行数门），然后：
 
