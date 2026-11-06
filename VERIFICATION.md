@@ -10,9 +10,10 @@
 | v0.13.1 | 2026-11-05 | ❌ **修法无效**（GUI 换入口换不到可用 core；新会话复核未通过，见 3.6 警告与 3.7） | `429e616` |
 | v0.14 | 2026-11-05 | ✅ 报表工具改走插件声明的 MCP 服务器（安装态握手通过；GUI 新会话待最终确认） | `9b360cf` |
 | v0.15 | 2026-11-05 | ✅ Web 看板 `scripts/dashboard.mjs`（离线单测 6 项 + 本机真实账本渲染通过；GUI 侧无新运行面） | `df8a267` |
-| v0.15.1 | 2026-11-06 | ✅ 看板显示会话名称（真机 4 个 sid8 全部命中名称；坏库/缺表退化为纯 hash 有单测钉死；node:sqlite 只读） | 待提交 |
+| v0.15.1 | 2026-11-06 | ✅ 看板显示会话名称（真机 4 个 sid8 全部命中名称；坏库/缺表退化为纯 hash 有单测钉死；node:sqlite 只读） | `93f6c58` |
+| v0.16 | 2026-11-06 | ✅ 记账模型维度+事件流、看板时间轴详情+按模型汇总（离线 97+12 全绿；真机旧账本走空态提示；GUI 新会话产生事件流待最终确认） | 待提交 |
 
-离线单测：**103/103 全绿**（`node --test test/register.test.ts`（94）+ `node --test test/dashboard.test.mjs`（9））。宿主校验器：`plugin validate` ✔、`plugin list` → `enabled`。安装态探针：`node test/probe-installed-mcp.mjs` ✔。
+离线单测：**109/109 全绿**（`node --test test/register.test.ts`（97）+ `node --test test/dashboard.test.mjs`（12））。宿主校验器：`plugin validate` ✔、`plugin list` → `enabled`。安装态探针：`node test/probe-installed-mcp.mjs` ✔。
 
 ---
 

@@ -2,7 +2,7 @@
 
 WorkBuddy 的**上下文治理 Mod**（Mod-first）：进程内 `tool.call` 中间件，在工具结果进入模型上下文之前做确定性压缩，原文落盘可回查。错误输出**永不压缩**。目标只有一个：**降本增效——让进入上下文的每一份 token 都携带高价值信息**。
 
-当前版本 v0.15.1 覆盖 **8 个高频出口 + 通配兜底**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（宿主原生字符串数组 + JSON 数组文本两种形态）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）；省量报表（会话内 `mcp__wb_ops__report` 工具 + 沙箱外 `node hooks/report.mjs` + **v0.15 起 `node scripts/dashboard.mjs --open` 浏览器看板**，按工具类型细分 分类 行；**v0.13 起默认开**，每次压缩的标记行还内联 `≈N tok → ≈M tok（省 P%）`；**v0.14 起该工具由插件清单声明 MCP 服务器提供，不再走 mod 注册**——原因见「v0.14 变更」）；上下文水位守卫（prompt.submit ≥85% 一行提醒）与压缩保留指示（session.compact instructions，Mod 版 PreCompact）；POLICY 之外的所有工具名（MCP、宿主新增）由谓词 matcher 兜底走通用压缩。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
+当前版本 v0.16.0 覆盖 **8 个高频出口 + 通配兜底**：Bash / PowerShell / TaskOutput（shell 类）、Grep / Glob（宿主原生字符串数组 + JSON 数组文本两种形态）、Read（按文件类型分档）、WebFetch / WebSearch（文档骨架）；shell 失败现场附一行 nextAction 提示（dsh-ops「遏制报错重试循环」原则的落点）；省量报表（会话内 `mcp__wb_ops__report` 工具 + 沙箱外 `node hooks/report.mjs` + **v0.15 起 `node scripts/dashboard.mjs --open` 浏览器看板**，按工具类型细分 分类 行；**v0.13 起默认开**，每次压缩的标记行还内联 `≈N tok → ≈M tok（省 P%）`；**v0.14 起该工具由插件清单声明 MCP 服务器提供，不再走 mod 注册**——原因见「v0.14 变更」）；上下文水位守卫（prompt.submit ≥85% 一行提醒）与压缩保留指示（session.compact instructions，Mod 版 PreCompact）；POLICY 之外的所有工具名（MCP、宿主新增）由谓词 matcher 兜底走通用压缩。压缩核心与事件无关，后续按事件逐个拓展到全生命周期出口。命名不叫 `wb-bash-ops` 正是因为这个路线图。
 
 | 工具 | 策略 |
 |---|---|
@@ -139,7 +139,8 @@ token 数是**估算**，公式与宿主 `TokenUtils.estimateTokensRough` 逐字
 | 单次压缩省了多少 | 不用做：每次压缩的 `[wb-ops]` 标记行自带 `原文 …≈N tok → ≈M tok（省 P%）` | 就在 wb 对话的工具结果里 |
 | 本机累计（按工具类型细分） | 在新会话说「调 `mcp__wb_ops__report`」，或沙箱外 `node hooks/report.mjs` | wb 聊天 / 终端 |
 | 每个会话省了多少（v0.15） | `node scripts/dashboard.mjs --open`（生成 `~/.workbuddy/wb-ops/dashboard.html` 并用浏览器打开）；或 `--serve [端口]` 挂本地服务，刷新即重读账本 | 浏览器看板：**会话名称**（v0.15.1，hash 弱化保留）+ 省量条 + kinds 明细 |
-| 原始记账数据 | `~/.workbuddy/wb-ops/stats/<sid8>.json`：`{calls,before,after,tokBefore,tokAfter,kinds}` | 文件 |
+| 每个模型省了多少 / 单会话时间轴（v0.16） | 同上，看板自动带：首页「按模型累计」表；会话卡片内「时间轴详情」展开 | 首页模型表（次数/原文/压缩后/省%）；详情 SVG 双折线（x=时刻，悬停圆点看该次工具+模型） |
+| 原始记账数据 | `~/.workbuddy/wb-ops/stats/<sid8>.json`：`{calls,before,after,tokBefore,tokAfter,kinds,models,events}`（后两个 v0.16 起） | 文件 |
 
 报表长这样：
 
@@ -162,6 +163,8 @@ token 数是**估算**，公式与宿主 `TokenUtils.estimateTokensRough` 逐字
 数据更新机制：看板**不连任何服务、不写数据库**，只读 `~/.workbuddy/wb-ops/stats/<sid8>.json`。记账开着时（v0.13 起默认开），wb 进程内的 mod 在**每次成功压缩后**整读整写那个小文件——读现值，累加本次 `before/after/tokBefore/tokAfter` 和按工具类型的 `kinds`，写回。所以账本是"边压边写"的，看板与账本之间没有任何缓存：快照模式生成时读一次，serve 模式每个请求读一次。`WB_OPS_STATS=0` 关掉后账本停止更新，看板显示的就是停更前的数据（历史会话的条目照常在）。
 
 会话名称（v0.15.1）：卡片头行以**会话名为主、hash 弱化保留**（名字旁边就是 sid8，与 `stats/`、`spill/` 目录一一对得上）。名字从宿主 `~/.workbuddy/workbuddy.db` 的 `sessions` 表只读解析（`custom_title` 优先于 `title`，即你在 wb 里改过名就用改名），stats 文件名只存前 8 位，按 `sid8` 前缀匹配。用 node 内置 `node:sqlite`（Node ≥22.5），零新依赖；db 缺失、表结构变更、node 版本不够——任何一环不对就**静默退化为纯 hash 展示**，看板不报错。serve 模式每次刷新重查，会话改名后刷新即见。
+
+时间轴详情与按模型（v0.16）：记账文件每条多两个维度——`models`（按模型累计，全史）与 `events`（每次压缩一条 `{t,k,m,tb,ta}`，封顶最近 300 次，更早只进累计）。看板首页因此出现「**按模型累计**」表（跨会话合并：次数/原文/压缩后/省%）；每张会话卡片有「**时间轴详情**」折叠区：纯 SVG 双折线（x=压缩时刻，虚线=原文 tok、实线=压缩后 tok，悬停圆点显示该次工具+模型+数值）+ 该会话按模型小表。模型名取自 `$.session.model()`，宿主拿不到/deny 时记 `unknown`，绝不反噬主流程。**诚实的边界**：v0.16 之前的旧账本没有这两个字段——看板如实显示空态提示，历史无法回填；只有升级后新发生的压缩进事件流。
 
 ## 配置（环境变量，经 `$.env.get` 读取）
 
@@ -222,7 +225,7 @@ bash test/run-acceptance.sh <合法UUID> "验收" WB_OPS_GUARD_PCT=10   # 真机
 ## 已验证 / 未验证
 
 - ✅ **③ 通配兜底的谓词 matcher（2026-11-05 真机闭环）**：`domain_search` 输出 52.1KB → 兜底压缩生效（头部 + `命中关键行` + 尾部，`[+NNNNB]` 单行截断正常）。函数谓词每次事件重评、路由真实生效。
-- ✅ mods 加载（CLI 启动日志 `hooks: tool.call prompt.submit session.compact` 三通道全注册；v0.14 起 `session.start` 已删——它只为已废弃的 mod 侧工具注册而存在）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复）、水位守卫与压缩保留指示（形状候选/阈值边界/关闭零触碰/fail-open）、③ 通配兜底（预算内零影响/非零透传/可关/谓词互斥）、① by-kind 分类账本（kinds 写入/聚合/渲染、无 kinds 老账本兼容）、② 水位数值文件（每轮小写/越线附带 Read 路径/写失败静默/stats-off 仍跟 guard）、④ GUI 安装助手（临时 HOME 装+卸、known/installed 形状、既有市场保留、cache payload 落地）、v0.11 形状诊断通道（只记结构/只记长度/限频/小输出不打扰）、v0.12 水位数据源（嵌套 context 候选/tokens=0 静默/transcript 尾部逆扫/权限探测/目录兜底/可关）、v0.13 token 口径（估算公式/标记行内联省比/记账 tok 字段/默认开/关掉零 IO）、v0.14 报表 MCP（渲染口径/坏文件跳过/真实子进程 JSON-RPC 握手/清单守卫）、v0.15 Web 看板（排序/字节回落/空账本/头行/转义）、v0.15.1 看板会话名（sqlite 解析/custom_title 优先/坏库退化）——离线 mock API 单测 **103 项全绿**（`node --test test/register.test.ts test/dashboard.test.mjs`）
+- ✅ mods 加载（CLI 启动日志 `hooks: tool.call prompt.submit session.compact` 三通道全注册；v0.14 起 `session.start` 已删——它只为已废弃的 mod 侧工具注册而存在）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示（模式表命中/扫描窗封顶/可关/防重复）、水位守卫与压缩保留指示（形状候选/阈值边界/关闭零触碰/fail-open）、③ 通配兜底（预算内零影响/非零透传/可关/谓词互斥）、① by-kind 分类账本（kinds 写入/聚合/渲染、无 kinds 老账本兼容）、② 水位数值文件（每轮小写/越线附带 Read 路径/写失败静默/stats-off 仍跟 guard）、④ GUI 安装助手（临时 HOME 装+卸、known/installed 形状、既有市场保留、cache payload 落地）、v0.11 形状诊断通道（只记结构/只记长度/限频/小输出不打扰）、v0.12 水位数据源（嵌套 context 候选/tokens=0 静默/transcript 尾部逆扫/权限探测/目录兜底/可关）、v0.13 token 口径（估算公式/标记行内联省比/记账 tok 字段/默认开/关掉零 IO）、v0.14 报表 MCP（渲染口径/坏文件跳过/真实子进程 JSON-RPC 握手/清单守卫）、v0.15 Web 看板（排序/字节回落/空账本/头行/转义）、v0.15.1 看板会话名（sqlite 解析/custom_title 优先/坏库退化）、v0.16 模型维度与事件流（models 累计/events 封顶 300/unknown 回落/时间轴 SVG/首页按模型块）——离线 mock API 单测 **109 项全绿**（`node --test test/register.test.ts test/dashboard.test.mjs`）
 - ✅ Grep/Glob 输出形状：从 86 条真实 transcript 确认 = JSON 字符串数组；**2026-11-05 真机再测发现宿主原生形态是 `content: string[]`**（不是 JSON 文本）→ v0.11 已适配（单测钉死：裁条目+单行说明、保持数组形态、预算内零影响、混合类型仍 fail-open）
 - ✅ **真机压缩闭环（2026-11-05 GUI 会话，pid 72880）**：Bash 13.2KB / PowerShell 14.9KB / TaskOutput 30.4KB / Read .log 24.5KB（含 `回看: Read offset=34 limit=180` 空洞指路）/ MCP 兜底 52.1KB / 错误现场 Exit Code 2 完整透传 + `[wb-ops 提示]` 一行 / 预算内零影响 / Read .ts 682 行原样不裁——5 次 spill 落盘 135KB
 - ✅ **报表工具（v0.14 已根治）**：`mcp__wb_ops__report` 现由插件清单 `mcpServers.wb_ops` 声明、宿主 MCP 管理器起进程注册，与 mod core 的能力差异完全解耦。已验：清单 `plugin validate` ✔、安装树入口真实跑通（`initialize` → `tools/list` → `tools/call`，见 `test/probe-installed-mcp.mjs`）、面板版本读的是 plugin.json（打印 0.14.0）。**唯一未验**：GUI 新会话里工具是否出现在清单——需要 `/reload-plugins` 或新开会话，见「v0.14 变更」。
@@ -253,6 +256,20 @@ bash test/run-acceptance.sh <合法UUID> "验收" WB_OPS_GUARD_PCT=10   # 真机
 - 会话日志 `~/.workbuddy/logs/<date>/<cwd>__<sid>.log` 里可见该行：mod 在**新起的运行时**（新 pid）里生效，老运行时（启用前启动的）不加载 → 启用后要**新开对话**才生效，`/reload-plugins` 不重新引导 mod（`bootstrapFunctionHookMods` 只在启动时调用且被记忆化）。
 
 其余待验证项（①②③④）待新会话里跑：宿主 Bash 大输出会先被自家 `<persisted-output>` 落盘（121KB），mod 的 `tool.call` 中间件看到的是压缩前还是压缩后的结果，需实测确认。
+
+## v0.16 变更（2026-11-06）—— 模型维度 + 逐压缩事件流：点进会话看时间轴，首页看每个模型
+
+**一句话**：回答两个真实问题——「每个会话每次压缩省了多少（时间轴）」「每个模型总共省了多少」。答案是数据此前根本没记：老账本只有会话级累计值，无逐事件序列、无模型维度。v0.16 把这两样补进记账，看板随之可视化；**旧账本无法回填**，看板对缺失数据如实显示空态。
+
+| 改动 | 说明 |
+|---|---|
+| `recordStats`（hooks/register.ts） | 每次压缩多取一次 `$.session.model()`（宿主 bundle 有 `session.model` 事件；deny/缺失/异常 → 记 `unknown`，fail-open）；stats JSON 新增 `models`（按模型累计，全史）与 `events`（每次一条 `{t,k,m,tb,ta}`，**封顶最近 300**——保热路径整读整写 ~30KB 量级，ponytail 注释标了升级路径） |
+| 看板首页 | 新增「按模型累计」表：跨会话合并 `models`，按原文 tok 降序，次数/原文/压缩后/省%；无数据时如实提示旧账本没有该维度 |
+| 会话卡片 | 新增「时间轴详情」折叠区：`timelineChart(events)` 纯 SVG 双折线（虚线=原文、实线=压缩后，x=事件时刻，悬停圆点 `<title>` 看工具+模型+数值）+ 该会话按模型小表；events<2 或旧账本 → 空态说明 |
+| `test/register.test.ts` | +3 项（模型维度+事件流、unknown 回落×2 路径、封顶 300 且累计不受影响）。harness 默认 mock `session.model`，`modelNoApi/modelThrows` 模拟降级 |
+| `test/dashboard.test.mjs` | +3 项（buildModel 事件过滤+模型聚合排序、timelineChart 边界+转义、renderHtml 首页块+空态）。总单测 97+12=**109** |
+
+热路径成本如实说：每次压缩的记账从 ~1KB 涨到 ~30KB 整读整写（封顶后不再涨）+ 一次进程内 `model()` 调用，仍远低于压缩本身；`WB_OPS_STATS=0` 全部归零。口径不变：token 估算公式与宿主同源，模型维度只统计 **wb-ops 改写过的工具输出**，不是模型的全部用量。
 
 ## v0.15.1 变更（2026-11-06）—— 看板显示会话名称：hash 是谁不知道，名字一看就懂
 
