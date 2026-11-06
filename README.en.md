@@ -12,8 +12,8 @@
 > In a long session, tool outputs often consume 60%+ of the context — mostly intermediate noise nobody reads again. wb-ops compresses them into a *head + key lines + tail* summary, saves the complete original to a local file, and hands the model a retrieval path.
 
 <div align="center">
-  <img src="docs/assets/dashboard.png" alt="wb-ops dashboard: ≈228.4k tokens saved (81.5%)" width="720">
-  <p><sub>The savings dashboard: per-session, per-model, per-compression timelines — one glance in the browser</sub></p>
+  <img src="docs/assets/dashboard.png" alt="wb-ops dashboard: ≈845.1k tokens saved (85.9%), 11 tracked sessions, 174 compressions" width="720">
+  <p><sub>The savings dashboard: per-session, per-model, per-compression timelines and event-by-event detail — one glance in the browser</sub></p>
 </div>
 
 ## ✨ Features
