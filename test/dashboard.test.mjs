@@ -133,3 +133,54 @@ test('renderHtml v0.16：首页按模型累计块；旧账本 → 空态提示�
   assert.match(old, /按模型汇总暂无数据/, '无 models 维度 → 如实说明');
   assert.match(old, /账本没有事件数据/, '无 events → 如实说明');
 });
+
+// ---------------- 回归钉：collectRows 必须透传 events/models ----------------
+// 上面所有 buildModel 测试都是手工喂 row() 对象——恰好绕过了真实读取路径。
+// v0.16 起看板消费 events/models，但 collectRows 从未透传过这两个字段
+// （时间轴与模型汇总在真实数据上一直是坏的，单测全绿掩盖了它）。
+// 这个测试从**临时目录里的真实 JSON 文件**读，钉死 文件 → collectRows → buildModel 全链路。
+
+test('collectRows → buildModel 全链路：账本文件里的 events/models 必须到达看板（回归钉）', async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'wbops-rows-'));
+  writeFileSync(join(dir, 'aa112233.json'), JSON.stringify({
+    calls: 2, before: 9000, after: 2000, tokBefore: 2200, tokAfter: 500,
+    tool: 'shell', ts: '2026-11-06T08:00:00.000Z',
+    kinds: { shell: { calls: 2, before: 9000, after: 2000, tokBefore: 2200, tokAfter: 500 } },
+    models: { 'glm-5.3-flash': { calls: 2, before: 9000, after: 2000, tokBefore: 2200, tokAfter: 500 } },
+    events: [
+      { t: 1730000000000, k: 'shell', m: 'glm-5.3-flash', tb: 1200, ta: 300 },
+      { t: 1730000060000, k: 'read', m: 'glm-5.3-flash', tb: 1000, ta: 200 },
+    ],
+  }));
+  const { collectRows } = await import('../lib/report-core.mjs');
+  const rows = collectRows(dir);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].events.length, 2, 'collectRows 必须透传 events');
+  assert.equal(rows[0].models['glm-5.3-flash'].calls, 2, 'collectRows 必须透传 models');
+  const m = buildModel(rows);
+  assert.equal(m.sessions[0].events.length, 2, '时间轴数据必须到达展示模型');
+  assert.deepEqual(m.models.map((x) => x.model), ['glm-5.3-flash'], '模型汇总必须非空');
+  const html = renderHtml(m, { dir });
+  assert.match(html, /<svg /, '真实账本必须渲染出时间轴图');
+  assert.ok(!html.includes('按模型汇总暂无数据'), '有 models 数据时不得出现空态文案');
+  assert.ok(!html.includes('账本没有事件数据'), '有 events 数据时不得出现空态文案');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('collectRows：老账本无 events/models 字段 → 空数组/空对象，看板走空态不崩', async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'wbops-old-'));
+  writeFileSync(join(dir, 'old00001.json'), JSON.stringify({
+    calls: 1, before: 500, after: 300, tool: 'shell', ts: '2026-11-05T10:00:00.000Z', kinds: {},
+  }));
+  const { collectRows } = await import('../lib/report-core.mjs');
+  const rows = collectRows(dir);
+  assert.deepEqual(rows[0].events, []);
+  assert.deepEqual(rows[0].models, {});
+  const html = renderHtml(buildModel(rows), { dir });
+  assert.match(html, /账本没有事件数据/); // 如实空态
+  rmSync(dir, { recursive: true, force: true });
+});

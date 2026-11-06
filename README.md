@@ -1,7 +1,7 @@
 # wb-ops
 
 [![version](https://img.shields.io/badge/version-0.17.0-blue)](.codebuddy-plugin/plugin.json)
-[![tests](https://img.shields.io/badge/tests-109%20passing-brightgreen)](#-开发与测试)
+[![tests](https://img.shields.io/badge/tests-130%20passing-brightgreen)](#-开发与测试)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.5-green)](#-安装)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](#-安装)
 
@@ -114,7 +114,7 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" pl
 ## 🧑‍💻 开发与测试
 
 ```bash
-node --test test/register.test.ts test/dashboard.test.mjs   # 128 项，全绿
+node --test test/register.test.ts test/dashboard.test.mjs   # 130 项，全绿
 node test/benchmark.mjs                                      # 保真度门禁（9 夹具）
 node test/audit-tiers.mjs --from-ledger                      # 漏压归因（只读账本，不扫 transcript）
 node test/acceptance-skip-ledger.mjs                         # 真机验收（ACP 驱动真实宿主）
