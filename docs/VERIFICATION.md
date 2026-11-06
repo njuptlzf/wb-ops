@@ -13,7 +13,7 @@
 | v0.15.1 | 2026-11-06 | ✅ 看板显示会话名称（真机 4 个 sid8 全部命中名称；坏库/缺表退化为纯 hash 有单测钉死；node:sqlite 只读） | `93f6c58` |
 | v0.16 | 2026-11-06 | ✅ 记账模型维度+事件流、看板时间轴详情+按模型汇总（离线 97+12 全绿；真机旧账本走空态提示；GUI 新会话产生事件流待最终确认） | 待提交 |
 
-离线单测：**109/109 全绿**（`node --test test/register.test.ts`（97）+ `node --test test/dashboard.test.mjs`（12））。宿主校验器：`plugin validate` ✔、`plugin list` → `enabled`。安装态探针：`node test/probe-installed-mcp.mjs` ✔。
+离线单测：**115/115 全绿**（`node --test test/register.test.ts`（103）+ `node --test test/dashboard.test.mjs`（12））。宿主校验器：`plugin validate` ✔、`plugin list` → `enabled`。安装态探针：`node test/probe-installed-mcp.mjs` ✔。
 
 ---
 
@@ -375,7 +375,7 @@ fs.writeFileSync(p, fs.readFileSync(p+'.wbops-bak')); fs.unlinkSync(p+'.wbops-ba
 ### ✅ 已验证
 
 - **通配兜底的谓词 matcher（真机闭环）**：`domain_search` 输出 52.1KB → 兜底压缩生效（头部 + 命中关键行 + 尾部，`[+NNNNB]` 单行截断正常）。函数谓词每次事件重评、路由真实生效。
-- **mods 加载**（CLI 启动日志 `hooks: tool.call prompt.submit session.compact` 三通道全注册）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示、水位守卫与压缩保留指示、通配兜底、分类账本、水位数值文件、GUI 安装助手、形状诊断通道、水位数据源、token 口径、报表 MCP、Web 看板、看板会话名、模型维度与事件流——离线 mock API 单测 **112 项全绿**（v0.17 锚点扩行新增 3 项）（`node --test test/register.test.ts test/dashboard.test.mjs`）
+- **mods 加载**（CLI 启动日志 `hooks: tool.call prompt.submit session.compact` 三通道全注册）、沙箱合规、压缩策略、透传条件、spill、并发去重、字节预算、分工具策略、错误 nextAction 提示、水位守卫与压缩保留指示、通配兜底、分类账本、水位数值文件、GUI 安装助手、形状诊断通道、水位数据源、token 口径、报表 MCP、Web 看板、看板会话名、模型维度与事件流——离线 mock API 单测 **115 项全绿**（v0.17 锚点扩行新增 3 项 + `e.input` 形状核对新增 3 项）（`node --test test/register.test.ts test/dashboard.test.mjs`）
 - **Grep/Glob 输出形状**：从 86 条真实 transcript 确认 = JSON 字符串数组；真机再测发现宿主原生形态是 `content: string[]`（不是 JSON 文本）→ 已适配（单测钉死：裁条目+单行说明、保持数组形态、预算内零影响、混合类型仍 fail-open）
 - **真机压缩闭环（GUI 会话）**：Bash 13.2KB / PowerShell 14.9KB / TaskOutput 30.4KB / Read .log 24.5KB（含 `回看: Read offset=34 limit=180` 空洞指路）/ MCP 兜底 52.1KB / 错误现场 Exit Code 2 完整透传 + `[wb-ops 提示]` 一行 / 预算内零影响 / Read .ts 682 行原样不裁——5 次 spill 落盘 135KB
 - **报表工具（v0.14 根治）**：`mcp__wb_ops__report` 由插件清单 `mcpServers.wb_ops` 声明、宿主 MCP 管理器起进程注册。已验：清单 `plugin validate` ✔、安装树入口真实跑通（`initialize` → `tools/list` → `tools/call`，见 `test/probe-installed-mcp.mjs`）
@@ -388,6 +388,126 @@ fs.writeFileSync(p, fs.readFileSync(p+'.wbops-bak')); fs.unlinkSync(p+'.wbops-ba
 
 - **宿主 `persisted-output` 阈值 ≈8KB 是硬天花板**：超过它宿主先落盘，mod 看不到原文。mod 的实际收益上限 = (预算, 8KB) 区间 + 宿主未落盘的其余工具
 - **报表工具在 GUI 新会话的最终确认**：需新开对话观察 `mcp__wb_ops__report` 是否出现在工具清单（`/reload-plugins` 对 mod 引导无效，对 MCP 组件是否有效未验）
-- **`tool.call` 事件里 `e.input` 的确切字段名**（候选 `input/tool_input/arguments` + `file_path/path/filePath`，判不出即透传，不会误伤）——Read 分档已真机验证；其余工具的 input 字段名未逐个核对
 - **GUI 重启后的插件列表识别与启用点击**未验证（真机已确认 mod 会加载，即注册表三件套有效；注册表写入格式对照本机宿主自写文件复刻，install-gui.mjs 有离线装/卸单测）
 - **`WB_OPS_STATS=0` 时是否仍起 MCP 进程**：当前不联动（工具在、数据为空时如实返回「还没有记账数据」）
+
+---
+
+## 8. v0.17：宿主 `e.input` 字段名逐个核对（P0 收口，2026-11-06）
+
+> 对应 [ROADMAP.md](ROADMAP.md) 的「P0 · 宿主 `e.input` 字段名逐个核对」。
+> 验收脚本：`node test/audit-tiers.mjs`（`--json` 供 CI；退出码 0 = 无缺口，1 = 有「判不出路径」样本）。
+
+### 8.1 结论：`e.input` 就是它，判据正确
+
+**宿主 mod 的 `tool.call` 事件里，工具入参对象在 `e.input` 字段上，且它是普通对象（非 JSON 字符串）。**
+`toolPathOf` 的判据 `e?.input ?? e?.tool_input ?? e?.arguments` + `typeof inp === 'object'` 与之相符，
+Read 分档的路径提取在真机上**从未失效过**。
+
+三条互相独立的证据链（任一条单独成立即足以定案，此处三条同时成立）：
+
+**① 静态：宿主 bundle 反查。**
+`codebuddy-lite-wb.mjs`（CLI 侧，与 GUI 同源）模块 `42804` 的 `dispatchModsToolCall`：
+
+```js
+let E = c && t.input != null && typeof t.input === 'object' && !Array.isArray(t.input),
+    A = t.input != null && typeof t.input === 'object' && !Array.isArray(t.input),
+    I = E ? {...structuredClone(t.input)} : {...R, input: structuredClone(t.input)},
+    P = {};
+if (E || A) for (let t of p) { /* p = ["tool","tool_use_id","agentId","consent"] */ }
+await n.dispatch("tool.call", {...I, tool: t.name, tool_use_id: t.callId, agentId: t.agentId}, ...)
+```
+
+- 被抽走（folded envelope）的字段只有 `p = ["tool","tool_use_id","agentId","consent"]`——**`input` 不在其中**；
+- `E` 为真时事件顶层就是 input 的展开（`{file_path: …}` 直接摊平），`E` 为假时是 `{...input, input: input}`；
+- 两种形态下 **`e.input` 恒为对象**，与 `E`/`c` 的取值无关。`E` 只影响"input 是摊平在顶层还是有 `input` 键"。
+
+**② 真机：Read 分档在 GUI 会话里真的跑通过。**
+`read` 档在宿主侧留下的唯一可观测痕迹是 `回看: Read offset=N limit=M`（`mode === 'read'` 独有，
+其他档位不产生）。全量 transcript 里读到 **11 处**，且账本 `stats/c48f9ba5.json`、`f87c445e.json`
+各记了 `read: 2` 次压缩。若 `e.input` 判不出，`toolPathOf` 返回 null → `register.ts` 的
+`if (!path) return r` 会直接透传，**不可能产生 read 档标记**。
+
+**③ 真机：全量 transcript 反查，零缺口。**
+把每个 Read 结果按 `file_path` → `classifyRead()` 分档，与实际行数对照，235 条超预算未压缩的 Read
+**全部**落在"行数门正确拦截"（`READ_SOURCE minLines=1500` / `READ_DOC|STRUCT 800` / `READ_DATA 200`），
+**没有一条**属于"判不出路径"：
+
+```
+== ③ Read 档归因（超预算却没被压缩）==
+   行数门正确拦截: 235
+   mod 已压缩:     14
+   宿主已落盘:     0
+   判不出路径(缺口): 0
+```
+
+### 8.2 逐个工具的 input 字段名（真实 transcript，7493 次调用）
+
+`node test/audit-tiers.mjs` ① 表，摘要：
+
+| 工具 | 调用数 | 路径键 | 实际 input 键名 | 走的档 |
+|---|---|---|---|---|
+| Read | 689 | `file_path` | `file_path, limit, offset` | read |
+| Edit | 1467 | `file_path` | `file_path, new_string, old_string` | other（兜底） |
+| Write | 245 | `file_path` | `content, file_path` | other（兜底） |
+| Grep | 169 | `path` | `path, pattern, -n, head_limit, output_mode, glob` | jsonlist |
+| Glob | 11 | `path` | `path, pattern` | jsonlist |
+| Bash | 4266 | — | `command, description, timeout, run_in_background` | shell |
+| PowerShell | 43 | — | `command, description, timeout` | shell |
+| TaskOutput | 129 | — | `task_id, block, timeout` | shell |
+| WebFetch | 24 | — | `url, prompt` | doc |
+| WebSearch | 25 | — | `query, freshness` | doc |
+| ViewImage | 152 | — | `image_path, query` | other（兜底） |
+| Edit/Write 之外无路径键者 | — | — | Task* 系列、present_files、ToolSearch、AskUserQuestion… | other（兜底） |
+
+**关键澄清**：`toolPathOf` **只在 `kind === 'read'` 时被调用**（`register.ts` 两处调用都在 read 分支内），
+shell / jsonlist / doc / other 四档**从不读 input 的路径字段**。因此：
+
+- 「`e.input` 字段名」只影响 **Read 一档**的深度分档（源码/文档/数据/结构），不影响别的档是否生效；
+- Write / Edit 走兜底是**策略有意为之**（写入类工具的输出本来就小，压缩收益低），
+  不是"判不出路径所以走兜底"——它们**有** `file_path`，`toolPathOf` 能取到，只是策略没让它们走 read 档；
+- Grep / Glob 的 `path` 是**目录**（如 `...\docs`），语义与 Read 的文件路径不同，本就不该喂给 `classifyRead`。
+
+### 8.3 分档命中率与未压缩归因
+
+`node test/audit-tiers.mjs` ②③ 表。全量 transcript（约 7500 条工具结果）：
+
+| 工具 | 结果数 | 超预算 | 结局 |
+|---|---|---|---|
+| Bash | 4262 | 232 | mod已压缩 47 · 非零Exit Code 透传 6 · 生效前历史 159 · 未归因 20 |
+| Read | 689 | 249 | 行数门拦截 235 · mod已压缩 14 |
+| Grep | 169 | 12 | 生效前历史 12 |
+| WebSearch | 25 | 11 | mod已压缩 3 · 生效前历史 8 |
+| WebFetch | 24 | 8 | mod已压缩 2 · 生效前历史 4 · 未归因 2 |
+| 其他 | — | — | 均 ≤2 条，逐条核对为历史数据或宿主自身落盘 |
+
+**"生效前历史"的口径**：压缩能力在本机 transcript 中最早留下 `[wb-ops]` 标记的时间是
+**2026-11-05 11:28:19**（本地时区）。此前 187 条"超预算未压缩"是插件尚未生效时的历史数据，**不计入缺口**。
+
+**未归因项逐条核对结果**（`未归因` 20 条 Bash + 2 条 WebFetch + 1 条 Glob）：
+
+- 20 条 Bash：全部落在 **11-05 13:45–13:53**（插件刚安装的调试期），此后（11-05 14:00 → 11-06 全天）
+  shell 档 **未压缩 0 条 / 压缩 49 条**——属历史残留，非当前缺陷；
+- 2 条 WebFetch + 1 条 Glob：经查该会话（`90e7ce2c`）**无 stats 账本**（当时 `WB_OPS_STATS` 未开），
+  且 Glob 那次的 transcript `arguments` 记录串位（记录了前一个 Bash 的参数），属宿主记录侧现象，
+  与 mod 无关。
+
+**11-06 全天（插件稳定运行期）shell 档：超预算未压缩 0 条，成功压缩 15 条。**
+
+### 8.4 由此得出的两条工程结论
+
+1. **`e.input` 判据无需修改**——它在真机上 100% 命中，`tool_input` / `arguments` 两个候选键是冗余但无害的兜底。
+2. **可观测性缺口**：本次定位耗时最长的不是判据本身，而是"**超预算却没被压缩**"缺少归因出口。
+   `register.ts` 现有诊断通道只覆盖"**结果形状判不出**"（`describeShape`），没有覆盖"**压缩没发生**"。
+   下一步应补一条 `compress-skipped` 诊断（记录 kind / 字节 / 行数 / 拦截原因：行数门 / deadline / 非零退出码），
+   让这类问题下次一分钟内自证，不必再翻 180MB bundle 与全量 transcript。
+
+### 8.5 本次核对的取舍
+
+- 未采用"装探针 mod 跑真机"的方案：探针版（0.17.0-probe）已装但**mod 只在新运行时生效**，
+  且 CLI 侧报 `Authentication required` 跑不了模型回合；而静态 bundle + 真机 transcript + 账本
+  三条证据已经闭环，探针的边际收益不足以抵消它引入的"重装/回滚"风险；
+- 全量 transcript 用**字节**口径判定超预算（与 `DEFAULT_BUDGET` 的字节语义一致）——
+  字符口径会漏掉中文密集的内容（Grep 12 条 vs 字符口径 8 条）；
+- 本节的"生效前历史"判定基于**本机** transcript，新机器跑同一脚本时该数字会变，
+  但"判不出路径 = 0"这个结论与机器无关。

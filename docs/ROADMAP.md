@@ -37,10 +37,22 @@ assertion/错误/异常/崩溃/致命`）的行，在预算内顺带保留其后
 
 ### P0 · 影响正确性
 
-- [ ] **宿主 `e.input` 字段名逐个核对**——Read 分档已真机验证，其余工具（Write / Edit /
+- [x] **宿主 `e.input` 字段名逐个核对**——Read 分档已真机验证，其余工具（Write / Edit /
       TaskOutput 等）的 input 字段名未逐个核对。当前策略是"判不出即透传"，不会误伤，
       但也意味着部分工具可能一直没走到分档逻辑。**验收**：真机跑一轮各工具输出，确认
       分档命中率，并把结论补进 [VERIFICATION.md](VERIFICATION.md)。
+      → **v0.17 收口**（2026-11-06）：`e.input` 确认是工具入参对象且恒为普通对象，
+      静态 bundle（`p` 只抽走 tool/tool_use_id/agentId/consent）+ 真机 Read 分档标记
+      （11 处 `回看: Read offset=`）+ 全量 transcript 反查（**判不出路径 0 条**）三条证据闭合。
+      逐工具键名与分档命中率见 [VERIFICATION.md §8](VERIFICATION.md#8-v017宿主-einput-字段名逐个核对p0-收口2026-11-06)；
+      验收脚本 `node test/audit-tiers.mjs`（退出码 0 = 无缺口）。
+      附带澄清：`toolPathOf` **只在 read 档被调用**，Write/Edit 走兜底是策略有意为之
+      （它们有 `file_path`，能取到，只是不该走 read 档），不是判据失效。
+- [ ] **补 `compress-skipped` 诊断出口**——P0 核对时暴露的可观测性缺口：现有诊断通道只覆盖
+      "结果形状判不出"，没有覆盖"**超预算却没被压缩**"。本次归因 235 条 Read 未压缩、
+      20 条 Bash 未压缩，耗时最长的就是手工反查。**验收**：某次压缩未发生时，
+      `debug/` 下留一条含 kind / 字节 / 行数 / 拦截原因（行数门 / deadline / 非零退出码 /
+      宿主已落盘）的记录；`test/audit-tiers.mjs` 能直接读它归因，不用翻 transcript。
 - [ ] **报表工具在 GUI 新会话的最终确认**——需新开对话观察 `mcp__wb_ops__report` 是否出现在
       工具清单（`/reload-plugins` 对 mod 引导有效，对 MCP 组件是否有效未验）。
       **验收**：新会话工具清单截图 + 一次实际调用成功。

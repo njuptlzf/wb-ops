@@ -9,6 +9,16 @@
 - **路线图**：新增 [docs/ROADMAP.md](docs/ROADMAP.md)——公开待办清单，按 P0/P1/P2 分级，每条写明「问题是什么 / 改完是什么样 / 怎么验收」
 - **算法文档**：`docs/ALGORITHMS.md`——各出口的省量算法、阈值与 token 估算口径首次成文
 - **保真度 benchmark**：`test/benchmark.mjs`（`node test/benchmark.mjs`）——9 个预埋锚点夹具实测压缩后上下文失真度：零捏造、critical 锚点 100%、对比朴素截断基线；兼作回归门禁（退出码门槛）。方法论与结果解读见 `docs/BENCHMARK.md`
+- **P0 收口：宿主 `e.input` 字段名核对**——确认真机事件里工具入参对象恒在 `e.input` 上且是**普通对象**
+  （非 JSON 字符串）。三条证据闭合：宿主 bundle 反查（folded envelope 只抽走
+  `tool/tool_use_id/agentId/consent`，`input` 不在其中）+ 真机 Read 档标记（11 处 `回看: Read offset=`）
+  + 全量 transcript 反查（**判不出路径 = 0 条**）。详见 [docs/VERIFICATION.md §8](docs/VERIFICATION.md)
+  - 新增 `test/audit-tiers.mjs`（`node test/audit-tiers.mjs`，`--json` 供 CI）——逐工具核对 input 键名、
+    统计分档命中率、并把「超预算却没被压缩」逐条归因。退出码 0 = 无缺口，1 = 有「判不出路径」样本
+  - `toolPathOf` 导出并补 3 项单测（钉死 `e.input` 是对象这件事），单测 112 → **115** 全绿
+  - 附带澄清：`toolPathOf` **只在 read 档被调用**，Write/Edit 走兜底是策略有意为之，不是判据失效
+  - 新增 P0 待办：**补 `compress-skipped` 诊断出口**——本次定位耗时最长的不是判据，
+    而是"超预算却没被压缩"缺少归因出口（现有诊断只覆盖"结果形状判不出"）
 
 ## [0.17.0] · 2026-11-06 —— 锚点扩行：错误行的上下文不再丢失
 

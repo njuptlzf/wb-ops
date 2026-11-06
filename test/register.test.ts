@@ -6,7 +6,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { register, compress, compressList, trimList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, estTokens, pickWatermark, pickWindow, projectSlug, lastInputTokens, probeTranscript, watermarkLine, guardNote, describeShape, hasLongString, toolNameOf, probeUsage, COMPACT_RETENTION } from '../hooks/register.ts';
+import { register, compress, compressList, trimList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, estTokens, pickWatermark, pickWindow, projectSlug, lastInputTokens, probeTranscript, watermarkLine, guardNote, describeShape, hasLongString, toolNameOf, toolPathOf, probeUsage, COMPACT_RETENTION } from '../hooks/register.ts';
 import { collectRows, renderSummary, summarize, EMPTY_TEXT } from '../lib/report-core.mjs';
 
 function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean; listFail?: boolean; list?: unknown[]; files?: Record<string, string>; usage?: unknown; usageFail?: boolean; cwd?: string } = {}) {
@@ -1184,4 +1184,35 @@ test('v0.12 watermarkLine 数据源标注（老调用不传参保持兼容）', 
   assert.match(watermarkLine({ used: 100, size: 200 }), /已用 100\/200 tok/);
   assert.match(watermarkLine({ used: 100, size: 200 }, 'transcript'), /来源 transcript/);
   assert.ok(!watermarkLine({ used: 100, size: 200 }).includes('来源'), '默认不加标注');
+});
+
+// ---------------------------------------------------------------------------
+// v0.17 P0：宿主 e.input 字段名核对（真机实锤，见 docs/VERIFICATION.md §8）
+//
+// 结论：工具入参对象恒在 e.input 上且是**普通对象**（不是 JSON 字符串）。
+// 这三条单测把该形状钉死，防止将来误改成只认 e.arguments（字符串）导致分档全线失效。
+// ---------------------------------------------------------------------------
+
+test('v0.17 toolPathOf：e.input 是普通对象 → 取到 file_path', () => {
+  // 真机形状：e.input = { file_path, limit, offset }
+  assert.equal(toolPathOf({ input: { file_path: 'C:/repo/app.ts', limit: 100 } }), 'C:/repo/app.ts');
+  // Grep/Glob 的 path（目录）也能取到——语义不同由调用方负责，判据本身要能取
+  assert.equal(toolPathOf({ input: { path: 'C:/repo/docs' } }), 'C:/repo/docs');
+  // filePath 是第三个候选键
+  assert.equal(toolPathOf({ input: { filePath: 'C:/repo/x.ts' } }), 'C:/repo/x.ts');
+});
+
+test('v0.17 toolPathOf：宿主若改形状（入参是 JSON 字符串）→ 判不出即透传，不误伤', () => {
+  // transcript 里 arguments 是 JSON 字符串，但**宿主 live event 不是**——
+  // 这里锁住「万一宿主变了」时的降级行为：取不到就返回 null（上层保守透传），绝不崩、绝不猜
+  assert.equal(toolPathOf({ input: '{"file_path":"C:/repo/app.ts"}' }), null);
+  assert.equal(toolPathOf({ arguments: '{"file_path":"C:/repo/app.ts"}' }), null);
+  assert.equal(toolPathOf({}), null);
+  assert.equal(toolPathOf(null), null);
+  assert.equal(toolPathOf({ input: { file_path: 42 } }), null, '非字符串不算路径');
+});
+
+test('v0.17 toolPathOf：tool_input / arguments 作为冗余兜底仍可用（宿主改形状时不全线失效）', () => {
+  assert.equal(toolPathOf({ tool_input: { file_path: 'C:/repo/a.ts' } }), 'C:/repo/a.ts');
+  assert.equal(toolPathOf({ arguments: { path: 'C:/repo/b.ts' } }), 'C:/repo/b.ts');
 });

@@ -839,7 +839,20 @@ export const COMPACT_RETENTION = '[wb-ops] 压缩保留优先级：错误/警告
 
 // ------------------------------------------------------------------ entry
 
-function toolPathOf(e: any): string | null {
+/**
+ * 从 tool.call 事件里取工具入参里的文件路径。
+ *
+ * 宿主形状已真机实锤（v0.17，见 docs/VERIFICATION.md §8）：
+ * 事件里工具入参对象恒在 `e.input` 上且是**普通对象**（不是 JSON 字符串）——
+ * 静态侧宿主 bundle 的 `dispatchModsToolCall` 只把
+ * `tool / tool_use_id / agentId / consent` 四个键抽走（folded envelope），
+ * `input` 不在其中；真机侧全量 transcript 反查「判不出路径 = 0 条」。
+ * 因此 `tool_input` / `arguments` 两个候选键是**冗余但无害**的兜底，保留以防宿主改形状。
+ *
+ * 判据键 `file_path / path / filePath` 覆盖真实 transcript 里的全部路径字段名：
+ * Read/Edit/Write = `file_path`，Grep/Glob = `path`（目录，语义不同，本就不喂 classifyRead）。
+ */
+export function toolPathOf(e: any): string | null {
   const inp = e?.input ?? e?.tool_input ?? e?.arguments;
   if (!inp || typeof inp !== 'object') return null;
   for (const k of ['file_path', 'path', 'filePath']) {
