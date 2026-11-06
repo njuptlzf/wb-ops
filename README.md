@@ -114,9 +114,18 @@ node "<WorkBuddy>/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs" pl
 ## 🧑‍💻 开发与测试
 
 ```bash
-node --test test/register.test.ts test/dashboard.test.mjs   # 109 项，全绿
+node --test test/register.test.ts test/dashboard.test.mjs   # 128 项，全绿
+node test/benchmark.mjs                                      # 保真度门禁（9 夹具）
+node test/audit-tiers.mjs --from-ledger                      # 漏压归因（只读账本，不扫 transcript）
 bash test/run-acceptance.sh <合法UUID> "验收" WB_OPS_GUARD_PCT=10   # 真机验收触发器
 ```
+
+**漏压归因**：压缩会主动放弃（Read 行数门、错误现场保护、软超时、宿主已落盘…），
+每次放弃都写一条跳过账本到 `~/.workbuddy/wb-ops/debug/skipped-<sid8>.json`——
+只含元数据（分档/工具/原因/字节/行数/路径），**绝不记正文**。
+账本按 (分档, 原因) 聚合计数，原因分三档：设计使然 / 性能 / **疑似缺口**
+（`no-path`、`shape-unknown`——真出现就要查判据）。
+`--from-ledger` 直接读它出归因表，不用翻 transcript。口径见 [docs/ALGORITHMS.md §7](docs/ALGORITHMS.md)。
 
 沙箱纪律：mods 内禁止 `node:require/process/global`（引擎会当场拒绝整个 mod）；所有宿主能力走 `$` 命名空间。
 

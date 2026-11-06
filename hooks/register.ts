@@ -66,6 +66,72 @@ const READ_LINE_NO = /^\s*(\d+)\u2192/;
 /** Read 分档（读完多半要接着改的，门槛高，中段不能随便丢） */
 const DATA_EXTS = ['.log', '.jsonl', '.ndjson', '.csv', '.tsv', '.out', '.err', '.txt'];
 
+/**
+ * v0.18 P0：压缩**未发生**的拦截原因（v0.17 核对时暴露的可观测性缺口）。
+ *
+ * 语义：这些原因全部表示「结果超预算却没有被压缩」。分两类：
+ *  - 有意为之（policy）：非零退出码、宿主已落盘、行数门、已带标记、超大输入、兜底关闭；
+ *  - 疑似缺口（gap）：判不出路径、形状判不出、压缩超时——真出现就得查。
+ *
+ * 稳定标识：审计脚本（test/audit-tiers.mjs）按这些字符串归因，改名会断历史账本。
+ */
+export type SkipReason =
+  | 'lines-gate'       // Read 行数门：行数不足该档门槛，保守透传
+  | 'deadline'         // 压缩软超时（WB_OPS_DEADLINE_MS）
+  | 'exit-code'        // 非零退出码：错误现场完整透传
+  | 'host-persisted'   // 宿主已落盘并指路（<persisted-output>）
+  | 'no-path'          // 判不出文件路径 → 无法分档（疑似缺口）
+  | 'already-marked'   // 已带 [wb-ops] 标记，防双压
+  | 'too-large'        // 超过 MAX_INPUT_BYTES 上限
+  | 'shape-unknown'    // 结果形状判不出（疑似缺口）
+  | 'fallback-off'     // 兜底压缩被关（WB_OPS_FALLBACK=0）
+  | 'under-budget'     // 字节未超预算（compress 内部早退，直接调用者用）
+  | 'unknown';         // 兜底分类（不该出现，出现即需排查）
+
+export const SKIP_REASONS: readonly SkipReason[] = [
+  'lines-gate', 'deadline', 'exit-code', 'host-persisted', 'no-path',
+  'already-marked', 'too-large', 'shape-unknown', 'fallback-off',
+  'under-budget', 'unknown',
+];
+
+/** 疑似缺口：真出现就要查判据/宿主形状，而不是当成设计使然。 */
+export const GAP_SKIP_REASONS: readonly SkipReason[] = ['no-path', 'shape-unknown'];
+/** 性能类：不是判据错，是软超时没赶上——可调 WB_OPS_DEADLINE_MS。 */
+export const PERF_SKIP_REASONS: readonly SkipReason[] = ['deadline'];
+
+/**
+ * 一条跳过记录：**只含元数据，绝不含工具正文**（正文绝不落盘是本项目的硬纪律）。
+ * bytes/lines 判不出时为 null（形状未知时连长度都不可信，宁缺毋滥）。
+ */
+export interface SkipEntry {
+  t: string;             // ISO 时刻
+  kind: string;          // 分档（shell/read/jsonlist/doc/other）
+  tool: string;          // 工具名
+  reason: SkipReason;
+  bytes: number | null;  // 原文字节
+  lines: number | null;  // 原文行数
+  chars?: number;        // 字符数（字节不可知时至少留个量级）
+  path?: string;         // read 档的文件路径（判不出路径时没有）
+}
+
+/** 归因聚合：按 (kind, reason) 汇总计数与体量，tools 给出工具维度拆分。 */
+export interface SkipAgg {
+  kind: string;
+  reason: SkipReason;
+  n: number;             // 次数
+  bytes: number;         // 累计字节（bytes 不可知的样本不计）
+  lines: number;         // 累计行数（同上）
+  tools: Record<string, number>;
+}
+
+/** 跳过账本文件结构（debug/skipped-<sid8>.json）。 */
+export interface SkipLedger {
+  v: number;
+  updated: string;
+  agg: SkipAgg[];
+  samples: SkipEntry[];  // 最近 N 条明细（封顶，计数不受影响）
+}
+
 interface ReadGate { minLines: number; hardBytes: number; skeleton: 'keyword' | 'symbol' | 'heading'; }
 const READ_SOURCE: ReadGate = { minLines: 1500, hardBytes: 0, skeleton: 'symbol' };
 const READ_DATA: ReadGate = { minLines: 200, hardBytes: 0, skeleton: 'keyword' };
@@ -210,6 +276,83 @@ async function writeDebug($: any, home: string, sid: string, name: string, entry
   } catch { /* 诊断失败不影响主链路 */ }
 }
 
+// ------------------------------------------------------- compress-skipped 账本（v0.18 P0）
+//
+// 为什么要有这个出口：v0.17 核对「超预算却没被压缩」时，只能翻全量 transcript
+// 手工反查（235 条 Read + 20 条 Bash，耗时最长的就是这一步）。根因是**压缩放弃
+// 时不留任何痕迹**——compress() 的每个 `return null` 都是匿名的，调用方只知道
+// 「没压」，不知道「为什么没压」。
+//
+// 现在：放弃压缩时把原因自报出来，聚合写进 debug/skipped-<sid>.json。
+// 归因从「翻 7500 条 transcript」变成「读一条账本」。
+//
+// 三条硬纪律：
+//  1. **绝不写正文**——只记 kind/工具名/原因/字节/行数/路径，不记任何输出内容。
+//  2. **热路径纪律**——账本是「未压缩」侧的观测，写盘频率天然低（压缩成功才频繁）。
+//  3. **失败静默**——账本写失败绝不影响主链路（透传原文照旧）。
+
+const SKIP_LEDGER_LIMIT = 60;              // 明细样本封顶（聚合计数不受影响）
+
+/**
+ * 把一条跳过记录并入账本（纯函数，便于单测）。
+ * 聚合按 (kind, reason) 归并，tools 维度再拆一层——归因时能直接回答
+ * 「哪个工具、哪个分档、被什么原因拦下」。
+ */
+export function mergeSkip(led: SkipLedger, e: SkipEntry): SkipLedger {
+  const agg = led.agg.slice();
+  const i = agg.findIndex((a) => a.kind === e.kind && a.reason === e.reason);
+  if (i >= 0) {
+    const a = agg[i];
+    agg[i] = {
+      ...a,
+      n: a.n + 1,
+      bytes: a.bytes + (e.bytes ?? 0),
+      lines: a.lines + (e.lines ?? 0),
+      tools: { ...a.tools, [e.tool]: (a.tools[e.tool] ?? 0) + 1 },
+    };
+  } else {
+    agg.push({
+      kind: e.kind, reason: e.reason, n: 1,
+      bytes: e.bytes ?? 0, lines: e.lines ?? 0,
+      tools: { [e.tool]: 1 },
+    });
+  }
+  const samples = led.samples.concat([e]);
+  return {
+    v: led.v,
+    updated: e.t,
+    agg,
+    samples: samples.length > SKIP_LEDGER_LIMIT ? samples.slice(-SKIP_LEDGER_LIMIT) : samples,
+  };
+}
+
+/** 空账本。 */
+export function emptySkipLedger(): SkipLedger {
+  return { v: 1, updated: '', agg: [], samples: [] };
+}
+
+/**
+ * 跳过账本落盘：~/.workbuddy/wb-ops/debug/skipped-<sid>.json。
+ * 读改写（无 append 能力，与 stats 账本同模式）；失败静默。
+ */
+async function writeSkipLedger($: any, home: string, sid: string, e: SkipEntry): Promise<void> {
+  try {
+    if (!home) return;
+    const dir = `${home.replace(/\\/g, '/')}/.workbuddy/wb-ops/debug`;
+    const path = `${dir}/skipped-${sid}.json`;
+    let led = emptySkipLedger();
+    try {
+      const cur = await $.fs.read(path);
+      const txt = typeof cur === 'string' ? cur : cur && typeof (cur as { text?: unknown }).text === 'string' ? (cur as { text: string }).text : '';
+      if (txt) {
+        const p = JSON.parse(txt) as Partial<SkipLedger>;
+        if (p && Array.isArray(p.agg) && Array.isArray(p.samples)) led = p as SkipLedger;
+      }
+    } catch { /* 首次：没有就空账本 */ }
+    await $.fs.write(path, JSON.stringify(mergeSkip(led, e)));
+  } catch { /* 账本写失败不影响主链路 */ }
+}
+
 // ---------------------------------------------------------------- byte utils
 
 /** UTF-8 字节长（预算与单行截断都按字节，中文内容不再漏过上界）。 */
@@ -235,6 +378,59 @@ export function estTokens(s: string): number {
     if (c >= 0x4e00 && c <= 0x9fa5) cjk++;
   }
   return Math.ceil(cjk / 1.8) + Math.ceil((s.length - cjk) / 4);
+}
+
+/** 行数：只数换行，**不分配数组**（大文本上 split('\n') 会炸内存）。
+ *  口径与 `raw.split('\n').length` 逐字一致（空串 = 1 行）。 */
+export function countLines(s: string): number {
+  let n = 1;
+  for (let i = s.indexOf('\n'); i >= 0; i = s.indexOf('\n', i + 1)) n++;
+  return n;
+}
+
+/** 形状描述里最大的字符串长度（判不出文本时至少能给个量级，不给正文）。
+ *  口径：字符串取 len；数组取 totalLen 与首元素的较大者；对象取各字段的最大值。 */
+export function maxStringLen(shape: Record<string, unknown>): number {
+  if (shape.t === 'string') return typeof shape.len === 'number' ? shape.len : 0;
+  if (shape.t === 'array') {
+    const total = typeof shape.totalLen === 'number' ? shape.totalLen : 0;
+    const first = shape.first ? maxStringLen(shape.first as Record<string, unknown>) : 0;
+    return Math.max(total, first);
+  }
+  if (shape.t === 'object' && shape.keys && typeof shape.keys === 'object') {
+    let m = 0;
+    for (const k of Object.keys(shape.keys as object)) {
+      m = Math.max(m, maxStringLen((shape.keys as Record<string, unknown>)[k]));
+    }
+    return m;
+  }
+  return 0;
+}
+
+/**
+ * 内容体量的**廉价上界探测**（不分配大字符串）。
+ *
+ * 用途：某些分支在拿到文本之前就要决定「要不要为这次跳过记账」——
+ * 比如 WB_OPS_FALLBACK=0 时未知工具整类不压，若先 extractText 再判断，
+ * 数组形态会走 JSON.stringify(arr)（大数组上是几 MB 的分配，纯浪费）。
+ * 这里只做遍历求和，不构造任何中间字符串。
+ *
+ * 口径：字符串取 UTF-8 字节；数组取各元素之和（对象元素递归）；对象取各字段之和；
+ * 深度封顶 4 层（再深的内容对体量判断无意义）。
+ */
+export function roughBytes(v: unknown, depth = 0): number {
+  if (typeof v === 'string') return byteLen(v);
+  if (v === null || typeof v !== 'object') return 0;
+  if (depth >= 4) return 0;
+  if (Array.isArray(v)) {
+    let n = 0;
+    for (const x of v) n += roughBytes(x, depth + 1);
+    return n;
+  }
+  const o = v as Record<string, unknown>;
+  let n = 0;
+  for (const k of Object.keys(o)) n += roughBytes(o[k], depth + 1);
+  return n;
 }
 
 /** 人读体量：13.4KB（原来直接甩 13200B，看不出省没省）。 */
@@ -360,26 +556,35 @@ function trimKeyToBudget(idx: number[], anchorSet: Set<number>, cap: number, cos
 /**
  * 纯函数压缩核心。返回 null = 放弃（调用方透传原文）。
  * opts.mode：shell（退出码门）| read（行数门槛+硬阀+空洞指路）| doc（标题/链接行命中）。
+ *
+ * v0.18 P0：可选的 `trace` 出参——放弃压缩时把**原因**自报出来。
+ * 此前所有 `return null` 都是匿名的，调用方只知道"没压"，不知道"为什么没压"，
+ * 于是「超预算却没被压缩」只能靠翻全量 transcript 反查（v0.17 归因 235+20 条的代价）。
+ * 现在原因直接落在账本里，一条记录即可归因，不必翻 transcript。
  */
 export function compress(
   raw: string, budget: number, deadlineMs: number, spillPath: string | null,
   opts?: { mode?: string; minLines?: number; hardBytes?: number; skeleton?: string },
+  trace?: { reason?: SkipReason; lines?: number },
 ): Compression | null {
   const mode = opts?.mode ?? 'shell';
   const bytes = byteLen(raw);
-  if (bytes <= budget) return null;
-  if (alreadyMarked(raw)) return null;
+  if (bytes <= budget) { if (trace) { trace.reason = 'under-budget'; trace.lines = countLines(raw); } return null; }
+  if (alreadyMarked(raw)) { if (trace) { trace.reason = 'already-marked'; trace.lines = countLines(raw); } return null; }
   const start = Date.now();
   const lines = raw.split('\n');
   const total = lines.length;
 
   // Read 分档行数门。硬阀例外只给「行数少体量巨大的 dump」；
   // 几百行的整篇文档不算 dump——误伤整篇文档比漏压贵。
-  if (opts?.minLines && total < opts.minLines && !(opts.hardBytes && bytes >= opts.hardBytes && total <= 60)) return null;
+  if (opts?.minLines && total < opts.minLines && !(opts.hardBytes && bytes >= opts.hardBytes && total <= 60)) {
+    if (trace) { trace.reason = 'lines-gate'; trace.lines = total; }
+    return null;
+  }
 
   if (mode === 'shell') {
     const code = exitCodeOf(lines);
-    if (code !== null && code !== 0) return null; // 错误现场：完整透传
+    if (code !== null && code !== 0) { if (trace) { trace.reason = 'exit-code'; trace.lines = total; } return null; } // 错误现场：完整透传
   }
 
   // ---- 少行巨字节：字节级首尾截（Grep content 单行 JSON、minified、dump；v0.2 缺的正好是这条）----
@@ -408,7 +613,10 @@ export function compress(
   const anchorSet = new Set<number>();
   let anchorLeft = ANCHOR_MAX;
   for (let i = 0; i < total; i++) {
-    if ((i & 511) === 0 && Date.now() - start >= deadlineMs) return null;
+    if ((i & 511) === 0 && Date.now() - start >= deadlineMs) {
+      if (trace) { trace.reason = 'deadline'; trace.lines = total; }
+      return null;
+    }
     const l = lines[i];
     if (l.length > 0 && hitKey(l, skeleton)) {
       pool.push(i);
@@ -871,7 +1079,32 @@ function makeHandler(kind: string) {
       if (!cfgP) cfgP = readCfg($);
       const cfg = await cfgP;
       if (!cfg.enabled) return r;
-      if (kind === 'other' && !cfg.fallback) return r; // ③ 兜底单独开关：WB_OPS_FALLBACK=0
+
+      const tool = toolNameOf(e);
+      // v0.18 P0：跳过账本出口。**只记元数据，绝不记正文**。
+      // 每条「超预算却没被压缩」的路径都经它留痕——归因从此读一条账本，不必翻 transcript。
+      const noteSkip = async (reason: SkipReason, info?: { bytes?: number | null; lines?: number | null; chars?: number; path?: string }) => {
+        if (!cfg.home) return;
+        try {
+          const sidDbg = await getSid8($);
+          await writeSkipLedger($, cfg.home, sidDbg, {
+            t: new Date().toISOString(),
+            kind, tool, reason,
+            bytes: info?.bytes ?? null,
+            lines: info?.lines ?? null,
+            chars: info?.chars,
+            path: info?.path,
+          });
+        } catch { /* 账本失败不影响主链路 */ }
+      };
+
+      if (kind === 'other' && !cfg.fallback) {
+        // ③ 兜底单独开关：WB_OPS_FALLBACK=0 → 未知工具一律不压（有意为之，但需可归因）。
+        // 只在**确实超预算**时记账：预算内的未知工具本就没打算压，记它是噪音。
+        const rb = roughBytes(r.result);
+        if (rb > cfg.budget) await noteSkip('fallback-off', { bytes: rb, lines: null });
+        return r;
+      }
       const t = extractText(r.result);
       if (!t) {
         // 判不出文本形状 → 记一条**结构**诊断（只写键名/类型/长度，不写正文）。
@@ -880,6 +1113,9 @@ function makeHandler(kind: string) {
         if (hasLongString(shape, cfg.budget)) {
           const sidDbg = await getSid8($);
           await writeDebug($, cfg.home, sidDbg, 'shape', { kind, tool: toolNameOf(e), shape });
+          // 形状判不出 → 走不到任何分档逻辑：**疑似缺口**，必须可归因。
+          // 字节数给不出精确值（判不出正文），用 roughBytes 求上界量级。
+          await noteSkip('shape-unknown', { bytes: null, lines: null, chars: roughBytes(r.result) });
         }
         return r;
       }
@@ -892,6 +1128,13 @@ function makeHandler(kind: string) {
         if (codes && codes.length) {
           const last = parseInt(codes[codes.length - 1].replace(/.*?:\s*/, ''), 10);
           if (Number.isFinite(last) && last !== 0) {
+            // 非零退出码：错误现场完整透传（有意为之）。
+            // 只在**确实超预算**时记账——预算内的失败输出本就不该压，记它是噪音。
+            // 归因价值在于「超预算却因失败现场而透传」这一类，不在于失败本身。
+            if (len * 3 >= cfg.budget) {
+              const eb = byteLen(t.raw);
+              if (eb > cfg.budget) await noteSkip('exit-code', { bytes: eb, lines: countLines(t.raw) });
+            }
             if (kind !== 'shell' || !cfg.hints || len > MAX_INPUT_BYTES || alreadyMarked(t.raw)) return r;
             const h = hintFor(t.raw);
             return h ? { ...r, result: t.sink.put(t.raw + '\n' + HINT_PREFIX + h) } : r;
@@ -899,17 +1142,26 @@ function makeHandler(kind: string) {
         }
       }
 
-      if (len > MAX_INPUT_BYTES) return r;        // 字节数 ≥ 字符数：字符都超限则字节必超，免全量扫描
+      if (len > MAX_INPUT_BYTES) { await noteSkip('too-large', { bytes: null, lines: null, chars: len }); return r; } // 字节数 ≥ 字符数：字符都超限则字节必超，免全量扫描
       if (len * 3 < cfg.budget) return r;         // 每字符顶格 3 字节也进不了预算：免测
       const bytes = byteLen(t.raw);               // 预算是字节语义；字符数会放过「字符≤预算<字节」的中文串
-      if (bytes <= cfg.budget || bytes > MAX_INPUT_BYTES) return r;
-      if (alreadyMarked(t.raw)) return r;         // 双压缩防护（含同类工具标记）
+      if (bytes <= cfg.budget) return r;           // 预算内：正常透传，不是「漏压」，不记账
+      if (bytes > MAX_INPUT_BYTES) { await noteSkip('too-large', { bytes, lines: countLines(t.raw) }); return r; }
+      if (alreadyMarked(t.raw)) { await noteSkip('already-marked', { bytes, lines: countLines(t.raw) }); return r; } // 双压缩防护（含同类工具标记）
 
       let gate: ReadGate | null = null;
       if (kind === 'read') {
-        if (t.raw.startsWith('<persisted-output>')) return r; // 宿主已落盘+指路，二次压缩纯属捣乱
+        if (t.raw.startsWith('<persisted-output>')) {
+          // 宿主已落盘+指路，二次压缩纯属捣乱（有意为之）
+          await noteSkip('host-persisted', { bytes, lines: countLines(t.raw) });
+          return r;
+        }
         const path = toolPathOf(e);
-        if (!path) return r;                 // 判不了文件类型：保守透传（源码被误伤比漏压贵）
+        if (!path) {
+          // 判不了文件类型：保守透传（源码被误伤比漏压贵）。**这是疑似缺口**，必须可归因。
+          await noteSkip('no-path', { bytes, lines: countLines(t.raw) });
+          return r;
+        }
         gate = classifyRead(path);
       }
 
@@ -940,8 +1192,14 @@ function makeHandler(kind: string) {
       const rp = kind === 'read' ? toolPathOf(e) : null;
       const ext = kind === 'jsonlist' || (rp && /\.(json|jsonl|ndjson)$/.test(rp.toLowerCase())) ? '.json' : '.txt';
       const path = await spillRaw($, e, t.raw, cfg.home, sid, ext);
-      const out = compress(t.raw, cfg.budget, cfg.deadlineMs, path, opts);
-      if (!out) return r;                    // 放弃压缩（门槛/行数门/软超时）
+      // v0.18 P0：把「为什么没压」带出来（行数门 / 软超时 / 非零退出码 / 已带标记）。
+      const trace: { reason?: SkipReason; lines?: number } = {};
+      const out = compress(t.raw, cfg.budget, cfg.deadlineMs, path, opts, trace);
+      if (!out) {
+        // 放弃压缩（门槛/行数门/软超时）——留下原因，归因不必再翻 transcript
+        await noteSkip(trace.reason ?? 'unknown', { bytes, lines: trace.lines ?? countLines(t.raw), path: rp ?? undefined });
+        return r;
+      }
       if (cfg.stats && cfg.home) await recordStats($, cfg.home, sid, kind, bytes, byteLen(out.text), estTokens(t.raw), estTokens(out.text));
       return { ...r, result: t.sink.put(out.text) };
     } catch {

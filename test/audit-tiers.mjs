@@ -6,13 +6,18 @@
 //   ② 统计各工具「真实调用数 vs 压缩命中数」，量化分档命中率；
 //   ③ 把「超预算却没被压缩」的结果逐条归因——区分「宿主/插件设计上的有意透传」与「真的判不出路径」。
 //
-// 数据源：本机真实 transcript（~/.workbuddy/projects/*/*.jsonl）与统计账本（~/.workbuddy/wb-ops/stats/*.json）。
+// v0.18 起新增 --from-ledger：**只读 wb-ops 自己的跳过账本**（debug/skipped-*.json）
+// 完成归因，不翻 transcript。理由：插件现在在「放弃压缩」时就记下了原因，
+// 所以归因不必再扫 7500 条 transcript 反查——读一条账本即可。
+//
+// 数据源（本机真实 transcript 与账本）：
 //   - transcript 里 function_call.arguments 是**字符串** JSON（持久化格式），
 //     但 function_call_result.output 是**对象**——两者形状不同，别混为一谈；
 //   - 账本只记「真正压缩过」的调用，因此账本次数 ≤ 真实超预算次数，差额要靠归因解释。
 //
 // 用法：
-//   node test/audit-tiers.mjs              # 打印完整报告
+//   node test/audit-tiers.mjs              # 打印完整报告（transcript 全量核对）
+//   node test/audit-tiers.mjs --from-ledger # 只读跳过账本归因（快，不扫 transcript）
 //   node test/audit-tiers.mjs --json       # 机器可读（CI 用）
 //   WB_OPS_PROJECTS=... WB_OPS_STATS=... node test/audit-tiers.mjs   # 自定义数据目录
 //
@@ -25,7 +30,9 @@ import { homedir } from 'node:os';
 const HOME = homedir();
 const PROJ = process.env.WB_OPS_PROJECTS || join(HOME, '.workbuddy', 'projects');
 const STATS = process.env.WB_OPS_STATS || join(HOME, '.workbuddy', 'wb-ops', 'stats');
+const DEBUG = process.env.WB_OPS_DEBUG || join(HOME, '.workbuddy', 'wb-ops', 'debug');
 const BUDGET = 4500; // 与 hooks/register.ts 的 DEFAULT_BUDGET 一致
+const FROM_LEDGER = process.argv.includes('--from-ledger');
 
 // 与 hooks/register.ts 的 POLICY / classifyRead 保持同步
 const POLICY = {
@@ -37,12 +44,88 @@ const PATH_KEYS = ['file_path', 'path', 'filePath'];
 const DATA_EXTS = ['.log', '.jsonl', '.ndjson', '.csv', '.tsv', '.out', '.err', '.txt'];
 const READ_GATES = { READ_SOURCE: 1500, READ_DOC: 800, READ_STRUCT: 800, READ_DATA: 200 };
 
+// 与 hooks/register.ts 的 SkipReason 保持同步（稳定标识，改名会断历史账本）
+const SKIP_REASONS = [
+  'lines-gate', 'deadline', 'exit-code', 'host-persisted', 'no-path',
+  'already-marked', 'too-large', 'shape-unknown', 'fallback-off', 'under-budget', 'unknown',
+];
+/** 疑似缺口：真出现要查判据/宿主形状，不是设计使然（与 register.ts 同口径）。 */
+const GAP_REASONS = ['no-path', 'shape-unknown'];
+/** 原因 → 人话（报告里直接给出「为什么没压」）。 */
+const REASON_CN = {
+  'lines-gate': 'Read 行数门（行数不足该档门槛）',
+  'deadline': '压缩软超时（可调 WB_OPS_DEADLINE_MS）',
+  'exit-code': '非零退出码：错误现场完整透传',
+  'host-persisted': '宿主已落盘并指路，无需二次压缩',
+  'no-path': '判不出文件路径 → 无法分档',
+  'already-marked': '已带 [wb-ops] 标记，防双压',
+  'too-large': '超过 8MB 上限，透传',
+  'shape-unknown': '结果形状判不出（疑似缺口）',
+  'fallback-off': '兜底压缩被关（WB_OPS_FALLBACK=0）',
+  'under-budget': '字节未超预算（正常透传，非漏压）',
+  'unknown': '未归因（出现即需排查）',
+};
+
 function classifyRead(path) {
   const p = (path || '').trim().toLowerCase().replace(/\\/g, '/');
   if (p.endsWith('.md') || p.endsWith('.markdown')) return 'READ_DOC';
   if (p.endsWith('.json')) return 'READ_STRUCT';
   for (const e of DATA_EXTS) if (p.endsWith(e)) return 'READ_DATA';
   return 'READ_SOURCE';
+}
+
+// ---------------------------------------------------------------- 跳过账本（v0.18）
+// 插件在「放弃压缩」时写下的账本：agg 是按 (kind, reason) 的聚合，samples 是明细。
+// 这是**插件自己说的**归因——比 transcript 反查更直接，也不必扫全量。
+
+function readSkipLedgers(dir = DEBUG) {
+  const agg = new Map();     // `${kind}/${reason}` -> {kind, reason, n, bytes, lines, tools:Map}
+  const samples = [];
+  let files = 0;
+  if (!existsSync(dir)) return { agg, samples, files };
+  for (const name of readdirSync(dir)) {
+    if (!name.startsWith('skipped-') || !name.endsWith('.json')) continue;
+    let d;
+    try { d = JSON.parse(readFileSync(join(dir, name), 'utf8')); } catch { continue; }
+    files++;
+    for (const a of d.agg || []) {
+      const k = `${a.kind}/${a.reason}`;
+      const cur = agg.get(k) || { kind: a.kind, reason: a.reason, n: 0, bytes: 0, lines: 0, tools: new Map() };
+      cur.n += a.n || 0;
+      cur.bytes += a.bytes || 0;
+      cur.lines += a.lines || 0;
+      for (const [t, n] of Object.entries(a.tools || {})) cur.tools.set(t, (cur.tools.get(t) || 0) + n);
+      agg.set(k, cur);
+    }
+    for (const s of d.samples || []) samples.push({ ...s, file: name });
+  }
+  return { agg, samples, files };
+}
+
+function reportLedger(led, lines) {
+  const P = (s = '') => lines.push(s);
+  P('== 跳过账本归因（插件自报，不翻 transcript）==');
+  if (!led.files) {
+    P('   暂无账本文件（插件尚未记录过跳过，或该会话未产生漏压）');
+    P('   账本路径：' + DEBUG + '/skipped-<sid8>.json');
+    return { gaps: 0, total: 0 };
+  }
+  P(`   账本文件: ${led.files} 个 · 目录: ${DEBUG}`);
+  P(`   ${'分档/原因'.padEnd(28)}${'次数'.padStart(7)}${'字节'.padStart(12)}${'行数'.padStart(9)}  说明`);
+  P('   ' + '-'.repeat(92));
+  let total = 0, gaps = 0;
+  for (const a of [...led.agg.values()].sort((x, y) => y.n - x.n)) {
+    const key = `${a.kind}/${a.reason}`;
+    const isGap = GAP_REASONS.includes(a.reason);
+    if (isGap) gaps += a.n;
+    total += a.n;
+    const tools = [...a.tools.entries()].map(([t, n]) => `${t}×${n}`).join(' ');
+    P(`   ${key.padEnd(28)}${String(a.n).padStart(7)}${(a.bytes ? (a.bytes / 1024).toFixed(1) + 'KB' : '-').padStart(12)}${(a.lines || '-').toString().padStart(9)}  ${REASON_CN[a.reason] || a.reason}${isGap ? '  ⚠疑似缺口' : ''}`);
+    if (tools) P(`   ${''.padEnd(28)}${''.padStart(7)}${''.padStart(12)}${''.padStart(9)}  工具: ${tools}`);
+  }
+  P('');
+  P(`   合计漏压: ${total} 次 · 疑似缺口: ${gaps} 次`);
+  return { gaps, total };
 }
 
 function outText(d) {
@@ -62,6 +145,36 @@ function walk(dir) {
     else if (name.endsWith('.jsonl')) out.push(p);
   }
   return out;
+}
+
+// ---------------------------------------------------------------- --from-ledger
+// 只读跳过账本完成归因：**不扫 transcript**（本机全量 transcript 可达数十 MB，
+// 扫一遍要几秒到几十秒；账本只有几十 KB，读它就是「读一条记录」）。
+// 这是 v0.18 P0 的核心验收：归因不再依赖翻全量 transcript。
+
+if (FROM_LEDGER) {
+  const led = readSkipLedgers();
+  const lines = [];
+  const r = reportLedger(led, lines);
+  lines.push('');
+  lines.push(r.gaps > 0
+    ? `== 结论：账本里有 ${r.gaps} 次疑似缺口（${GAP_REASONS.join(' / ')}）——需排查判据 ==`
+    : '== 结论：账本里无疑似缺口——所有漏压都有已知原因 ==');
+  if (process.argv.includes('--json')) {
+    console.log(JSON.stringify({
+      ok: r.gaps === 0,
+      source: 'skip-ledger',
+      total: r.total,
+      gaps: r.gaps,
+      agg: [...led.agg.values()].map((a) => ({
+        kind: a.kind, reason: a.reason, n: a.n, bytes: a.bytes, lines: a.lines,
+        tools: Object.fromEntries(a.tools),
+      })),
+    }, null, 2));
+  } else {
+    console.log(lines.join('\n'));
+  }
+  process.exit(r.gaps > 0 ? 1 : 0);
 }
 
 // ---------------------------------------------------------------- 采集
@@ -260,9 +373,25 @@ if (preActive.size) {
   for (const [t, n] of [...preActive].sort((a, b) => b[1] - a[1])) P(`     ${t}: ${n}`);
 }
 
-const fail = readDetail.noPath > 0;
+// ⑥ v0.18：插件自报的跳过账本 —— 与上面 transcript 反查**交叉核对**。
+// 账本记录的是插件「当下决定不压」的原因，transcript 反查是事后猜的；两者应能互证。
 P('');
-P(fail ? '== 结论：存在「判不出路径」缺口，需修复 ==' : '== 结论：核对通过——无「判不出路径」缺口 ==');
+const led = readSkipLedgers();
+const ledStat = reportLedger(led, lines);
+if (led.files) {
+  P('');
+  P('   交叉核对：账本归因 vs transcript 反查');
+  const txUnattributed = (outcome.get('Bash')?.get('未归因(需排查)') || 0) + (outcome.get('PowerShell')?.get('未归因(需排查)') || 0);
+  P(`     transcript 侧「未归因(需排查)」: ${txUnattributed} 条`);
+  P(`     账本侧「unknown(未归因)」: ${ledStat.gaps >= 0 ? ([...led.agg.values()].find((a) => a.reason === 'unknown')?.n || 0) : 0} 条`);
+  P(`     账本侧疑似缺口(no-path/shape-unknown): ${ledStat.gaps} 条`);
+}
+
+const fail = readDetail.noPath > 0 || ledStat.gaps > 0;
+P('');
+P(fail
+  ? `== 结论：存在缺口需修复（transcript 反查 no-path=${readDetail.noPath} / 账本疑似缺口=${ledStat.gaps}）==`
+  : '== 结论：核对通过——无「判不出路径」类缺口 ==');
 
 if (process.argv.includes('--json')) {
   const out = {
@@ -271,6 +400,15 @@ if (process.argv.includes('--json')) {
     outcomes: Object.fromEntries([...outcome].map(([t, m]) => [t, Object.fromEntries(m)])),
     readDetail,
     ledger: Object.fromEntries(ledger),
+    skipLedger: {
+      files: led.files,
+      total: ledStat.total,
+      gaps: ledStat.gaps,
+      agg: [...led.agg.values()].map((a) => ({
+        kind: a.kind, reason: a.reason, n: a.n, bytes: a.bytes, lines: a.lines,
+        tools: Object.fromEntries(a.tools),
+      })),
+    },
   };
   console.log(JSON.stringify(out, null, 2));
 } else {

@@ -6,6 +6,25 @@
 
 ## [未发布]
 
+- **P0 收口：`compress-skipped` 诊断出口**——补上「超预算却没被压缩」的归因出口。
+  压缩会主动放弃（Read 行数门、错误现场保护、软超时、双压防护、宿主已落盘），
+  但放弃时**不留任何痕迹**：输出超了预算、原样进了上下文、模型多烧一轮 token，
+  而插件侧没有任何记录说清是谁拦下的。v0.17 归因 235 条 Read + 20 条 Bash 未压缩时，
+  耗时最长的不是判据本身（20 分钟就定了），而是翻全量 transcript 逐条反查。
+
+  | 改动 | 说明 |
+  |---|---|
+  | `compress()` 新增 trace 出参 | 此前每个 `return null` 都是**匿名**的，调用方只知道"没压"、不知道"为什么没压"。现在每个放弃点自报原因：`lines-gate` / `deadline` / `exit-code` / `already-marked` / `under-budget` |
+  | 跳过账本 `debug/skipped-<sid8>.json` | `agg` 按 (分档, 原因) 聚合计数 + `samples` 最近 60 条明细。**只有明细封顶，计数不受影响**——否则账本会随会话变长而失真 |
+  | 原因分三档 | 设计使然（`lines-gate`/`exit-code`/`host-persisted`/`already-marked`/`too-large`/`fallback-off`）/ 性能（`deadline`）/ **疑似缺口**（`no-path`、`shape-unknown`）。分档后账本才可用：全是噪音的账本等于没有 |
+  | 记账口径 | **只在确实超预算时记一笔**。预算内的正常透传与失败不记账（首版对所有非零退出码记账，正常失败命令立刻淹没账本）；压缩成功也不记 |
+  | `audit-tiers.mjs --from-ledger` | **只读账本出归因表，不扫 transcript**（本机全量 transcript 可达数十 MB）。退出码 0=无疑似缺口，可直接作 CI 门禁 |
+  | 默认模式交叉核对 | 全量 transcript 核对时并列打印账本归因：transcript 反查是**事后猜**的，账本是**当下决定**的，两者应能互证 |
+  | 测试 | 单测 115 → **128** 全绿（新增 13 项：四种 trace 原因 / 账本绝不含正文 / 预算内不记账 / 聚合语义 / 行数口径与 split 一致 / 写盘失败 fail-open 等）；benchmark 9 夹具门禁全通过，省量 85.6% 与 v0.17 持平（**本改动不触碰压缩算法**，只加观测） |
+
+  归因成本从「翻 7500 条 transcript」降到「读一条账本」。详见
+  [docs/VERIFICATION.md §9](docs/VERIFICATION.md#9-v018compress-skipped-诊断出口p0-收口2026-11-06)。
+
 - **路线图**：新增 [docs/ROADMAP.md](docs/ROADMAP.md)——公开待办清单，按 P0/P1/P2 分级，每条写明「问题是什么 / 改完是什么样 / 怎么验收」
 - **算法文档**：`docs/ALGORITHMS.md`——各出口的省量算法、阈值与 token 估算口径首次成文
 - **保真度 benchmark**：`test/benchmark.mjs`（`node test/benchmark.mjs`）——9 个预埋锚点夹具实测压缩后上下文失真度：零捏造、critical 锚点 100%、对比朴素截断基线；兼作回归门禁（退出码门槛）。方法论与结果解读见 `docs/BENCHMARK.md`

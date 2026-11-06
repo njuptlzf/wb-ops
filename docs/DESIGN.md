@@ -100,11 +100,50 @@ wb-ops 的对应规避：
 | 文件 | 记什么 | 什么时候写 |
 |---|---|---|
 | `~/.workbuddy/wb-ops/debug/shape-<sid8>.json` | 工具名 + result 的键名/类型/长度（**无正文**） | 判不出文本形状**且**内容超预算时，每会话最多 20 条 |
+| `~/.workbuddy/wb-ops/debug/skipped-<sid8>.json` | **跳过账本**：超预算却没被压缩的归因（kind/工具/原因/字节/行数/路径，**无正文**） | 每次「放弃压缩」时（见 §6.1） |
 | `~/.workbuddy/wb-ops/debug/usage-<sid8>.json` | `$.session.usage()` 的返回形状（键名/类型/数值）+ deny 文案 | 形状**变化**时（形状不变不重复写） |
 | `~/.workbuddy/wb-ops/debug/fsprobe-<sid8>.json` | transcript 沙箱读权限探测：`ok/err/path/bytes/truncated`（无正文） | 结论**变化**时（首次 fallback、读权限变化、体积跨过 8MB 门槛） |
 | `~/.workbuddy/wb-ops/debug/compact-<sid8>.json` | `session.compact` 事件：`trigger/hadBase/baseLen/mergedLen/hasRetention`（不记正文） | 每次 compact 事件 |
 
 隐私纪律：字符串一律只记长度，正文永不落盘。宿主升级后若某通道突然不生效，先看这几个文件。
+
+### 6.1 跳过账本（v0.18）：为什么「为什么没压」必须能查
+
+**问题**：压缩的核心是「超预算就压回去」。但压缩会**主动放弃**——Read 行数门、
+错误现场保护、软超时、双压防护、宿主已落盘……放弃时若不留痕，就出现一个
+**只能靠事后反查才能发现**的黑洞：输出超了预算却原样进了上下文，模型多烧一轮 token，
+而插件侧**没有任何记录**说清是谁拦下的。
+
+v0.17 的 P0 核对撞上过这个洞：235 条 Read 未压缩 + 20 条 Bash 未压缩，
+归因只能翻全量 transcript（7500+ 条）逐条反查——耗时最长的就是这一步，
+且结论无法复现（下次再遇到还是得重查一遍）。
+
+**做法**：放弃压缩时把**原因**自报出来，落进跳过账本：
+
+```text
+debug/skipped-<sid8>.json{
+  agg:     [ {kind, reason, n, bytes, lines, tools:{}} ],   // 按 (分档, 原因) 聚合
+  samples: [ {t, kind, tool, reason, bytes, lines, path} ≤60 条 ],  // 最近明细
+}
+```
+
+**为什么是聚合 + 明细两段**：聚合回答「哪一类漏压最多、漏了多少体量」，
+明细回答「具体是哪个文件、哪次调用」。只有明细会被封顶，**计数不受影响**——
+否则账本会随会话变长而失真。
+
+**记账口径**（关键）：只在**确实超预算**时记一笔。预算内的正常透传不是漏压，
+记账就成噪音；同理，非零退出码也只在**超预算**时才记（预算内的失败本就不该压）。
+
+**原因分类**（三档，审计脚本据此判缺口）：
+
+| 档 | 原因 | 含义 |
+|---|---|---|
+| 设计使然 | `lines-gate` / `exit-code` / `host-persisted` / `already-marked` / `too-large` / `fallback-off` | 有意为之，透传是策略 |
+| 性能 | `deadline` | 不是判据错，是软超时没赶上（可调 `WB_OPS_DEADLINE_MS`） |
+| **疑似缺口** | `no-path` / `shape-unknown` | 判据没命中或宿主改形状——**真出现就要查** |
+
+**归因成本从「翻全量 transcript」降到「读一条账本」**：
+`node test/audit-tiers.mjs --from-ledger` 直接读账本出归因表，不扫 transcript。
 
 ## 7. 报表工具为什么走 MCP 而不是 mod 注册
 

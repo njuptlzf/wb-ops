@@ -48,11 +48,22 @@ assertion/错误/异常/崩溃/致命`）的行，在预算内顺带保留其后
       验收脚本 `node test/audit-tiers.mjs`（退出码 0 = 无缺口）。
       附带澄清：`toolPathOf` **只在 read 档被调用**，Write/Edit 走兜底是策略有意为之
       （它们有 `file_path`，能取到，只是不该走 read 档），不是判据失效。
-- [ ] **补 `compress-skipped` 诊断出口**——P0 核对时暴露的可观测性缺口：现有诊断通道只覆盖
+- [x] **补 `compress-skipped` 诊断出口**——P0 核对时暴露的可观测性缺口：现有诊断通道只覆盖
       "结果形状判不出"，没有覆盖"**超预算却没被压缩**"。本次归因 235 条 Read 未压缩、
       20 条 Bash 未压缩，耗时最长的就是手工反查。**验收**：某次压缩未发生时，
       `debug/` 下留一条含 kind / 字节 / 行数 / 拦截原因（行数门 / deadline / 非零退出码 /
       宿主已落盘）的记录；`test/audit-tiers.mjs` 能直接读它归因，不用翻 transcript。
+      → **v0.18 收口**（2026-11-06）：跳过账本 `debug/skipped-<sid8>.json` 落地——
+      `agg` 按 (分档, 原因) 聚合计数 + `samples` 最近 60 条明细（封顶不影响计数）。
+      11 种原因枚举（`SkipReason`）分三档：设计使然 / 性能（deadline）/ **疑似缺口**
+      （`no-path`、`shape-unknown`）。`compress()` 新增 trace 出参，放弃压缩时自报原因
+      （此前每个 `return null` 都是匿名的，调用方只知道"没压"、不知道"为什么没压"）。
+      记账口径：**只在确实超预算时记一笔**——预算内的正常透传与失败不记账（否则账本成噪音）。
+      `node test/audit-tiers.mjs --from-ledger` 直接读账本出归因表，**不扫 transcript**；
+      默认模式则把账本归因与 transcript 反查**交叉核对**。
+      归因成本从「翻 7500 条 transcript」降到「读一条账本」。
+      单测 115 → **128** 全绿（新增 13 项，含「账本绝不含正文」「预算内不记账」
+      「聚合语义」「行数口径与 split 一致」）；详见 [VERIFICATION.md §9](VERIFICATION.md#9-v018compress-skipped-诊断出口p0-收口2026-11-06)。
 - [ ] **报表工具在 GUI 新会话的最终确认**——需新开对话观察 `mcp__wb_ops__report` 是否出现在
       工具清单（`/reload-plugins` 对 mod 引导有效，对 MCP 组件是否有效未验）。
       **验收**：新会话工具清单截图 + 一次实际调用成功。

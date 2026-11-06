@@ -96,3 +96,39 @@ stats/<sid8>.json{
 ```
 
 三份报表（会话内 MCP 工具 / CLI `hooks/report.mjs` / 看板 `scripts/dashboard.mjs`）共用 `lib/report-core.mjs` 聚合，口径不可能漂移。**只计 wb-ops 实际改写的输出**——模型回复、用户输入、系统提示不在内。
+
+## 7. 跳过账本（v0.18）：「为什么没压」的归因口径
+
+记账只记**压成功**的；**没压**的那侧另有一本账。
+
+```text
+触发条件：结果**超预算**（byteLen > budget）却最终没被压缩
+落盘：debug/skipped-<sid8>.json（只含元数据，正文绝不落盘）
+
+agg:     [ {kind, reason, n, bytes, lines, tools:{}} ]     // 按 (分档, 原因) 聚合
+samples: [ {t, kind, tool, reason, bytes, lines, path} ≤60 ]  // 最近明细（封顶，计数不受影响）
+```
+
+**为什么只在超预算时记**：预算内的正常透传不是漏压，记它是噪音。
+非零退出码同理——只在**超预算**时记（预算内的失败本就不该压）。
+同理，压缩成功时**不记**（账本是「未压缩」侧的观测）。
+
+原因枚举（`SkipReason`，稳定标识——审计脚本按这些字符串归因，改名会断历史账本）：
+
+| reason | 触发点 | 档 |
+|---|---|---|
+| `lines-gate` | Read 行数门：行数不足该档门槛 | 设计使然 |
+| `exit-code` | 非零退出码：错误现场完整透传 | 设计使然 |
+| `host-persisted` | 宿主已落盘并指路（`<persisted-output>`） | 设计使然 |
+| `already-marked` | 已带 `[wb-ops]` 标记，防双压 | 设计使然 |
+| `too-large` | 超过 8MB 上限 | 设计使然 |
+| `fallback-off` | 兜底压缩被关（`WB_OPS_FALLBACK=0`） | 设计使然 |
+| `deadline` | 压缩软超时（`WB_OPS_DEADLINE_MS`） | 性能 |
+| `no-path` | 判不出文件路径 → 无法分档 | **疑似缺口** |
+| `shape-unknown` | 结果形状判不出 | **疑似缺口** |
+| `under-budget` | 字节未超预算（`compress()` 内部早退） | 正常 |
+| `unknown` | 兜底分类（不该出现，出现即需排查） | **疑似缺口** |
+
+**归因入口**：`node test/audit-tiers.mjs --from-ledger` —— 只读账本出归因表，
+**不扫 transcript**（本机全量 transcript 可达数十 MB）。退出码 0 = 无疑似缺口。
+

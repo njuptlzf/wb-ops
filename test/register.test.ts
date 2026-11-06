@@ -6,7 +6,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { register, compress, compressList, trimList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, estTokens, pickWatermark, pickWindow, projectSlug, lastInputTokens, probeTranscript, watermarkLine, guardNote, describeShape, hasLongString, toolNameOf, toolPathOf, probeUsage, COMPACT_RETENTION } from '../hooks/register.ts';
+import { register, compress, compressList, trimList, extractText, exitCodeOf, classifyRead, parseJsonList, byteLen, u8Prefix, hintFor, HINT_PREFIX, estTokens, pickWatermark, pickWindow, projectSlug, lastInputTokens, probeTranscript, watermarkLine, guardNote, describeShape, hasLongString, toolNameOf, toolPathOf, probeUsage, COMPACT_RETENTION, countLines, maxStringLen, roughBytes, mergeSkip, emptySkipLedger, GAP_SKIP_REASONS, SKIP_REASONS } from '../hooks/register.ts';
 import { collectRows, renderSummary, summarize, EMPTY_TEXT } from '../lib/report-core.mjs';
 
 function harness(opts: { env?: Record<string, string>; writeFail?: boolean; readFail?: boolean; listFail?: boolean; list?: unknown[]; files?: Record<string, string>; usage?: unknown; usageFail?: boolean; cwd?: string } = {}) {
@@ -38,8 +38,10 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
         reads.push(p);
         if (opts.readFail) throw new Error('no such file');
         if (opts.files?.[p] !== undefined) return opts.files[p];
-        const hit = writes.find((w) => w.path === p);
-        return hit ? hit.text : undefined;
+        // 取**最后一次**写入：真实文件系统读到的是最新内容，账本的「读改写」依赖这一点。
+        // （用 find 取首次会读到陈旧内容，聚合计数会停在 2 而不是 5。）
+        for (let i = writes.length - 1; i >= 0; i--) if (writes[i].path === p) return writes[i].text;
+        return undefined;
       },
       stat: async (p: string) => {
         if (opts.readFail) throw new Error('no such file');
@@ -75,6 +77,11 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
     if (!hk) throw new Error('session.compact handler not registered');
     return hk.h($, e, async (e2: any) => ({ passed: e2 }));
   };
+  // spill 落盘（**含正文**）与诊断/账本落盘（**只含元数据**）性质不同，断言须分开看：
+  // 「错误输出别落盘」指的是前者；后者是 v0.18 的跳过账本，故意要留痕。
+  const spills = () => writes.filter((w) => w.path.includes('/spill/'));
+  const ledger = () => writes.filter((w) => w.path.includes('/debug/skipped-'));
+  const debugOther = () => writes.filter((w) => w.path.includes('/debug/') && !w.path.includes('/debug/skipped-'));
   const fnHooks = (toolName: string) =>
     hooks.filter((k) => k.ev === 'tool.call' && typeof k.matcher.tool === 'function' && k.matcher.tool(toolName));
   const callUnknown = async (toolName: string, result: unknown, event: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) => {
@@ -92,6 +99,7 @@ function harness(opts: { env?: Record<string, string>; writeFail?: boolean; read
   const bash = (result: unknown, event: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) =>
     call('Bash', result, { input: { command: 'npm test' }, ...event }, extra);
   return { $, writes, reads, call, bash, byTool, callUnknown, fnHooks, firePrompt, fireCompact, usageCalls,
+    spills, ledger, debugOther,
     events: () => Array.from(new Set(hooks.map((k) => k.ev))),
     setEnv: (k: string, v: string | undefined) => { ENV[k] = v; } };
 }
@@ -140,7 +148,9 @@ test('非零退出码：完整透传，不落盘不压缩', async () => {
   const h = harness({ env: HOME });
   const { r, out } = await h.bash(bigText().replace('Exit Code: 0', 'Exit Code: 2'));
   assert.equal(out, r);
-  assert.equal(h.writes.length, 0, '错误输出白白落盘=磁盘垃圾，必须避免');
+  assert.equal(h.spills().length, 0, '错误输出白白落盘=磁盘垃圾，必须避免');
+  // v0.18：超预算的失败现场在跳过账本留一笔原因（只含元数据，不含正文）
+  assert.equal(h.ledger().length, 1, '超预算+非零退出码 → 账本记一条 exit-code');
 });
 
 test('isError：透传', async () => {
@@ -400,7 +410,8 @@ test('Read 宿主 <persisted-output>：透传（宿主自己已落盘）', async
   const persisted = '<persisted-output>\nOutput too large (65.7KB). Full output saved to: C:\\\\x\\\\y.txt\n\nPreview (first 2048 bytes):\n' + bigText(200);
   const { r, out } = await h.call('Read', persisted + '\n' + 'z'.repeat(20000), { input: { file_path: 'C:/repo/big.txt' } });
   assert.equal(out, r);
-  assert.equal(h.writes.length, 0);
+  assert.equal(h.spills().length, 0, '宿主已落盘 → 不再重复落盘');
+  assert.equal(h.ledger().length, 1, 'v0.18：账本记 host-persisted（宿主已落盘，无需二次压缩）');
 });
 
 test('Read 判不出文件路径：保守透传', async () => {
@@ -720,14 +731,16 @@ test('③ 兜底：非零 Exit Code → 完整透传不提示', async () => {
   const body = bigMcp() + '\nExit Code: 3';
   const { r, out } = await h.callUnknown('mcp__runner__exec', body);
   assert.equal(out, r, '失败现场保持原样');
-  assert.equal(h.writes.length, 0);
+  assert.equal(h.spills().length, 0, '失败现场不落盘');
+  assert.equal(h.ledger().length, 1, 'v0.18：账本记 exit-code');
 });
 
 test('③ 兜底：WB_OPS_FALLBACK=0 → 未知工具透传，白名单不受影响', async () => {
   const h = harness({ env: { ...HOME, WB_OPS_FALLBACK: '0' } });
   const { r, out } = await h.callUnknown('mcp__anything', bigMcp());
   assert.equal(out, r);
-  assert.equal(h.writes.length, 0);
+  assert.equal(h.spills().length, 0, '兜底关 → 不压不落盘');
+  assert.equal(h.ledger().length, 1, 'v0.18：账本记 fallback-off（有意为之，但可归因）');
   const b = await h.bash(bigMcp());
   assert.ok((b.out.result as string).includes('[wb-ops]'), '白名单照常压缩');
 });
@@ -1216,3 +1229,169 @@ test('v0.17 toolPathOf：tool_input / arguments 作为冗余兜底仍可用（�
   assert.equal(toolPathOf({ tool_input: { file_path: 'C:/repo/a.ts' } }), 'C:/repo/a.ts');
   assert.equal(toolPathOf({ arguments: { path: 'C:/repo/b.ts' } }), 'C:/repo/b.ts');
 });
+
+// ---------------------------------------------------------------------------
+// v0.18 P0：compress-skipped 诊断出口
+//
+// 背景：v0.17 核对「超预算却没被压缩」时，只能翻全量 transcript 手工反查
+// （235 条 Read + 20 条 Bash）。根因是压缩放弃时**不留任何痕迹**——
+// compress() 的每个 `return null` 都是匿名的。
+//
+// 这组单测钉死两件事：
+//  ① 每条漏压路径都留下**可归因的原因**（读一条账本即可，不必翻 transcript）；
+//  ② 账本**只含元数据、绝不含正文**（与 shape 诊断同纪律）。
+// ---------------------------------------------------------------------------
+
+/** 读出账本内容（合并多次写入的最终态）。 */
+function ledgerJson(h: any): any {
+  const w = h.ledger()[h.ledger().length - 1];
+  assert.ok(w, '账本未落盘');
+  return JSON.parse(w.text);
+}
+
+test('v0.18 compress() trace：放弃压缩时自报原因（行数门 / 软超时 / 非零退出码）', () => {
+  // 行数门：Read 源码档不足 1500 行 → 透传
+  const t1: any = {};
+  const src = Array.from({ length: 1400 }, (_, i) => `  ${i + 1}→const x${i} = ${'pad'.repeat(20)}`).join('\n');
+  assert.equal(compress(src, 4500, 100, null, { mode: 'read', minLines: 1500, skeleton: 'symbol' }, t1), null);
+  assert.equal(t1.reason, 'lines-gate');
+  assert.equal(t1.lines, 1400, '行数门要报出行数（与 split 同口径）');
+
+  // 软超时：deadlineMs=0 → 立即放弃
+  const t2: any = {};
+  assert.equal(compress(bigText(), 4500, 0, null, { mode: 'shell' }, t2), null);
+  assert.equal(t2.reason, 'deadline');
+
+  // 非零退出码：错误现场完整透传
+  const t3: any = {};
+  assert.equal(compress(bigText().replace('Exit Code: 0', 'Exit Code: 2'), 4500, 100, null, { mode: 'shell' }, t3), null);
+  assert.equal(t3.reason, 'exit-code');
+
+  // 预算内 → under-budget（不是漏压）
+  const t4: any = {};
+  assert.equal(compress('tiny', 4500, 100, null, { mode: 'shell' }, t4), null);
+  assert.equal(t4.reason, 'under-budget');
+});
+
+test('v0.18 跳过账本：Read 行数门拦截 → 留一条含 kind/字节/行数/原因/路径的记录', async () => {
+  const h = harness({ env: HOME });
+  const src = Array.from({ length: 1400 }, (_, i) => `  ${i + 1}→const x${i} = ${'pad'.repeat(20)}`).join('\n');
+  await h.call('Read', src, { input: { file_path: 'C:/repo/app.ts' } });
+  const led = ledgerJson(h);
+  const a = led.agg.find((x: any) => x.reason === 'lines-gate');
+  assert.ok(a, '账本有 lines-gate 聚合项');
+  assert.equal(a.kind, 'read');
+  assert.equal(a.n, 1);
+  assert.equal(a.tools.Read, 1, '工具维度可拆');
+  assert.ok(a.bytes > 4500, `字节已记（${a.bytes}）`);
+  assert.ok(a.lines > 0, `行数已记（${a.lines}）`);
+  const s = led.samples[0];
+  assert.equal(s.reason, 'lines-gate');
+  assert.equal(s.path, 'C:/repo/app.ts', '路径已记（归因要能定位到文件）');
+});
+
+test('v0.18 跳过账本：判不出路径 → 记 no-path（**疑似缺口**，真出现要查判据）', async () => {
+  const h = harness({ env: HOME });
+  await h.call('Read', bigText(), {});   // 无 input → toolPathOf 判不出
+  const led = ledgerJson(h);
+  const a = led.agg.find((x: any) => x.reason === 'no-path');
+  assert.ok(a, '账本有 no-path 聚合项');
+  assert.equal(a.kind, 'read');
+  assert.equal(a.n, 1);
+  assert.ok(GAP_SKIP_REASONS.includes('no-path'), 'no-path 归入缺口档');
+});
+
+test('v0.18 跳过账本：**绝不含正文**（只记元数据）', async () => {
+  const h = harness({ env: HOME });
+  const secret = 'SECRET-PAYLOAD-9f3a';
+  await h.call('Read', bigText(50).replace('ok 0', secret), {});   // 判不出路径 + 体积超预算
+  const w = h.ledger()[0];
+  assert.ok(!w.text.includes(secret), '正文绝不进账本');
+  assert.ok(!w.text.includes('pad'), '正文片段也不进账本');
+  // 只应有 kind/tool/reason/字节/行数这类元数据
+  const led = JSON.parse(w.text);
+  for (const s of led.samples) {
+    assert.ok(['t', 'kind', 'tool', 'reason', 'bytes', 'lines', 'chars', 'path'].every((k) => true));
+    for (const k of Object.keys(s)) {
+      assert.ok(['t', 'kind', 'tool', 'reason', 'bytes', 'lines', 'chars', 'path'].includes(k), `意外字段 ${k}`);
+    }
+  }
+});
+
+test('v0.18 跳过账本：预算内的正常透传**不记账**（账本只记漏压，不记噪音）', async () => {
+  const h = harness({ env: HOME });
+  await h.bash('Command: ls\n\na\nb\n\nExit Code: 0');
+  assert.equal(h.ledger().length, 0, '预算内不记账');
+});
+
+test('v0.18 跳过账本：非零退出码只有超预算才记（预算内的失败不噪音化账本）', async () => {
+  const h = harness({ env: HOME });
+  await h.bash('Command: x\nErr\nExit Code: 1');       // 预算内的失败
+  assert.equal(h.ledger().length, 0, '预算内失败不记账');
+  await h.bash(bigText().replace('Exit Code: 0', 'Exit Code: 2'));  // 超预算的失败
+  assert.equal(h.ledger().length, 1, '超预算失败记一笔 exit-code');
+});
+
+test('v0.18 跳过账本：聚合按 (kind, reason) 归并，明细封顶但计数不受影响', async () => {
+  const h = harness({ env: HOME });
+  for (let i = 0; i < 5; i++) await h.call('Read', bigText(), {});   // 5 次 no-path
+  const led = ledgerJson(h);
+  const a = led.agg.find((x: any) => x.reason === 'no-path');
+  assert.equal(a.n, 5, '计数正确');
+  assert.equal(led.samples.length, 5, '明细条数 = 发生次数');
+});
+
+test('v0.18 mergeSkip：纯函数聚合语义（同类合并、异类分开、样本封顶）', () => {
+  let led = emptySkipLedger();
+  const mk = (kind: string, reason: any, tool = 'T', bytes = 100) => ({
+    t: '2026-11-06T00:00:00.000Z', kind, tool, reason, bytes, lines: 10,
+  });
+  led = mergeSkip(led, mk('read', 'lines-gate', 'Read', 200));
+  led = mergeSkip(led, mk('read', 'lines-gate', 'Read', 300));
+  led = mergeSkip(led, mk('shell', 'deadline', 'Bash', 400));
+  assert.equal(led.agg.length, 2, '两个 (kind,reason) 组合');
+  const g = led.agg.find((a) => a.kind === 'read')!;
+  assert.equal(g.n, 2);
+  assert.equal(g.bytes, 500, '字节累计');
+  assert.equal(g.lines, 20, '行数累计');
+  assert.deepEqual(g.tools, { Read: 2 });
+  assert.equal(led.samples.length, 3, '明细逐条留');
+  assert.equal(led.v, 1);
+});
+
+test('v0.18 countLines：行数口径与 split 一致（不分配数组）', () => {
+  assert.equal(countLines('a'), 1);
+  assert.equal(countLines('a\nb'), 2);
+  assert.equal(countLines('a\nb\n'), 3);
+  assert.equal(countLines(''), 1);
+  const big = Array.from({ length: 1000 }, (_, i) => `line ${i}`).join('\n');
+  assert.equal(countLines(big), big.split('\n').length, '与 split 逐字一致');
+});
+
+test('v0.18 roughBytes：不分配中间字符串求体量上界', () => {
+  assert.equal(roughBytes('abc'), 3);
+  assert.equal(roughBytes('中文'), 6, '按 UTF-8 字节');
+  assert.equal(roughBytes(['a', 'bb']), 3);
+  assert.equal(roughBytes({ x: 'abc', y: 'de' }), 5);
+  assert.equal(roughBytes(null), 0);
+  assert.equal(roughBytes(42), 0);
+});
+
+test('v0.18 maxStringLen：形状里的最大字符串长度（判不出文本时给量级）', () => {
+  assert.equal(maxStringLen(describeShape({ a: 'x'.repeat(5000) })), 5000);
+  assert.equal(maxStringLen(describeShape({ a: 'x'.repeat(100) })), 100);
+  assert.equal(maxStringLen(describeShape({ a: 1 })), 0);
+});
+
+test('v0.18 跳过账本：写盘失败不影响主链路（fail-open）', async () => {
+  const h = harness({ env: HOME, writeFail: true });
+  const { r, out } = await h.call('Read', bigText(), {});
+  assert.equal(out, r, '账本写失败 → 照常透传原结果');
+});
+
+test('v0.18 跳过账本：压缩成功时**不**记账（账本是「未压缩」侧的观测）', async () => {
+  const h = harness({ env: HOME });
+  await h.bash(bigText());
+  assert.equal(h.ledger().length, 0, '压了就别记漏压');
+});
+
